@@ -56,12 +56,10 @@ class EebusLPCActiveSwitch(EebusEntity, SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Activate LPC limit."""
         await self.coordinator.async_set_lpc_active(True)
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Deactivate LPC limit."""
         await self.coordinator.async_set_lpc_active(False)
-        await self.coordinator.async_request_refresh()
 
 
 class EebusHeartbeatSwitch(EebusEntity, SwitchEntity):

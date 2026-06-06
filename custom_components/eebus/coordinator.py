@@ -506,6 +506,14 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
+            # Optimistically update coordinator data so the UI reflects the
+            # written state immediately without waiting for the next poll.
+            if self.data is not None:
+                if self.data.get("consumption_limit") is None:
+                    self.data["consumption_limit"] = {}
+                self.data["consumption_limit"]["value_watts"] = value_watts
+                self.data["consumption_limit"]["is_active"] = True
+                self.data["consumption_limit"]["duration_seconds"] = duration
         except grpc.aio.AioRpcError as err:
             if _is_unimplemented(err):
                 self._lpc_supported = False
@@ -547,9 +555,12 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         # If activating, ensure duration > 0 so the Bosch WP does not
         # immediately reset the active flag when duration=0 is received.
+        # If deactivating, explicitly send duration=0 to clear the limit.
         duration = int(current.duration_seconds or 0)
         if active and duration == 0:
             duration = 3600
+        elif not active:
+            duration = 0
         try:
             await stub.WriteConsumptionLimit(
                 proto_stubs.WriteLoadLimitRequest(
@@ -561,6 +572,12 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
+            # Optimistically update coordinator data so the UI reflects the
+            # written state immediately without waiting for the next poll,
+            # which could race against the device processing the write.
+            if self.data and self.data.get("consumption_limit") is not None:
+                self.data["consumption_limit"]["is_active"] = active
+                self.data["consumption_limit"]["duration_seconds"] = duration
         except grpc.aio.AioRpcError as err:
             if _is_unimplemented(err):
                 self._lpc_supported = False

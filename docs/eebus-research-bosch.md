@@ -323,22 +323,53 @@ eebus-bridge (Go backend)
 
 ## References
 
-### EEBUS Documentation
-- EEBUS Specification: [eebus-go library](https://github.com/enbility/eebus-go)
-- SPINE Protocol: [spine-go library](https://github.com/enbility/spine-go)
-- Ship Protocol: [ship-go library](https://github.com/enbility/ship-go)
+## References
 
-### Device-Specific
-- Bosch Compress 5800i datasheet
-- EEBUS certified devices list
+### EEBUS Documentation & Standards
+- **EEBUS official site**: https://www.eebus.org/
+  - General architecture and interoperability scope.
+- **EEBUS specifications pointer** (via eebus-go README): https://www.eebus.org/media-downloads/
+  - Source for SHIP/SPINE and use-case specifications.
+- **enbility eebus-go README**: https://github.com/enbility/eebus-go
+  - Documents supported SHIP/SPINE base and example use cases used by this project.
+- **EEBUS Specification**: [eebus-go library](https://github.com/enbility/eebus-go)
+- **SPINE Protocol**: [spine-go library](https://github.com/enbility/spine-go)
+- **Ship Protocol**: [ship-go library](https://github.com/enbility/ship-go)
 
-### Integration
-- Home Assistant EEBUS documentation
-- gRPC protocol buffers (proto files in `gen/proto/`)
+### Bosch & Industry References
+- **Bosch/Robotron/PPC announcement**: https://www.robotron.de/en/company/current-topics/news/article/bosch-home-comfort-robotron-and-ppc-digitize-control-of-heat-pumps
+  - Confirms Bosch heat pump EEBUS control path for grid/tariff use cases.
+- **Bosch EEBUS gateway case study**: https://halready.com/case-study/smart-gateway-for-bosch-heat-pumps-with-eebus/
+  - Mentions Bosch heat pump gateway implementation with EEBUS protocol integration.
+- **Bosch Compress 5800i datasheet**
+- **EEBUS certified devices list**
+
+### Integration Documentation
+- **Home Assistant EEBUS documentation**
+- **gRPC protocol buffers** (proto files in `gen/proto/`)
+- **bridge-eebus-ha project**: This repository
 
 ---
 
-## Document History
+## Implementation Insights
+
+### Observed Device Behavior
+Based on extensive testing in this project:
+
+- **Bosch Compress 5800i can provide power values via MPC**: Total consumption is reliable and always available
+- **Energy counters can return "data not available"**: This is device-specific; handled gracefully by returning NotFound instead of errors
+- **LPC and heartbeat channels are independently available**: Even if MPC is partially unavailable, control channels remain functional
+- **Per-phase measurements often unavailable**: Single-phase devices return "data not available" for L2/L3 (expected behavior)
+- **Dynamic behavior is key**: Only metrics delivered by the device should be exposed to HA
+
+### Implementation Decision Framework
+- Expose all available MPC metrics to Home Assistant via `GetMeasurements`
+- Treat unavailable measurements as unsupported/not available, not as internal errors
+- Keep dynamic behavior: only metrics delivered by the device are populated in HA
+- Validate SKI at bridge boundary (gRPC layer) - never accept empty SKI
+- Implement failsafe limits as device-persistent parameters (not transient commands)
+
+---
 
 | Date | Version | Changes |
 |---|---|---|
