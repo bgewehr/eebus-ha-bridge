@@ -6,19 +6,21 @@ import (
 	"time"
 
 	eebusapi "github.com/enbility/eebus-go/api"
-	eglpc "github.com/enbility/eebus-go/usecases/eg/lpc"
 	ucapi "github.com/enbility/eebus-go/usecases/api"
+	eglpc "github.com/enbility/eebus-go/usecases/eg/lpc"
 	spineapi "github.com/enbility/spine-go/api"
+	"github.com/enbility/spine-go/model"
 	"github.com/volschin/eebus-bridge/internal/eebus"
 )
 
 // LPCWrapper wraps the eebus-go LPC (Limitation of Power Consumption) use case
 // and routes events to the internal EventBus.
 type LPCWrapper struct {
-	uc       *eglpc.LPC
-	bus      *eebus.EventBus
-	registry *eebus.DeviceRegistry
-	debug    bool
+	uc          *eglpc.LPC
+	localEntity spineapi.EntityLocalInterface
+	bus         *eebus.EventBus
+	registry    *eebus.DeviceRegistry
+	debug       bool
 }
 
 var errLPCNotInitialized = errors.New("lpc use case not initialized")
@@ -33,7 +35,11 @@ func (w *LPCWrapper) Setup(localEntity spineapi.EntityLocalInterface) {
 	if localEntity == nil {
 		return
 	}
+	w.localEntity = localEntity
 	w.uc = eglpc.NewLPC(localEntity, w.HandleEvent)
+	if _, err := model.NewDeviceDiagnosis(localEntity); err != nil {
+		log.Printf("creating local DeviceDiagnosis heartbeat server failed: %v", err)
+	}
 }
 
 // UseCase returns the underlying eebus-go LPC use case (may be nil before Setup).
@@ -134,4 +140,38 @@ func (w *LPCWrapper) ConsumptionNominalMax(entity spineapi.EntityRemoteInterface
 		return 0, errLPCNotInitialized
 	}
 	return w.uc.ConsumptionNominalMax(entity)
+}
+
+// StartHeartbeat starts periodic DeviceDiagnosis heartbeat requests to the
+// remote controllable system. If ski is empty, the first known remote entity is used.
+func (w *LPCWrapper) StartHeartbeat(ski string) error {
+	_ = ski
+	if w.localEntity == nil {
+		return errLPCNotInitialized
+	}
+	return w.localEntity.HeartbeatManager().StartHeartbeat()
+}
+
+// StopHeartbeat stops the periodic heartbeat requests.
+func (w *LPCWrapper) StopHeartbeat() error {
+	if w.localEntity == nil {
+		return errLPCNotInitialized
+	}
+	w.localEntity.HeartbeatManager().StopHeartbeat()
+	return nil
+}
+
+// IsHeartbeatWithinDuration reports whether the last heartbeat request succeeded recently.
+func (w *LPCWrapper) IsHeartbeatWithinDuration(_ spineapi.EntityRemoteInterface) bool {
+	if w.localEntity == nil {
+		return false
+	}
+	return w.localEntity.HeartbeatManager().IsHeartbeatWithinDuration()
+}
+
+func (w *LPCWrapper) IsHeartbeatRunning() bool {
+	if w.localEntity == nil {
+		return false
+	}
+	return w.localEntity.HeartbeatManager().IsHeartbeatRunning()
 }
