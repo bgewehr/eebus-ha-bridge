@@ -506,6 +506,14 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
+            # Optimistically update coordinator data so the UI reflects the
+            # written state immediately without waiting for the next poll.
+            if self.data is not None:
+                if self.data.get("consumption_limit") is None:
+                    self.data["consumption_limit"] = {}
+                self.data["consumption_limit"]["value_watts"] = value_watts
+                self.data["consumption_limit"]["is_active"] = True
+                self.data["consumption_limit"]["duration_seconds"] = duration
         except grpc.aio.AioRpcError as err:
             if _is_unimplemented(err):
                 self._lpc_supported = False
@@ -564,6 +572,12 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
+            # Optimistically update coordinator data so the UI reflects the
+            # written state immediately without waiting for the next poll,
+            # which could race against the device processing the write.
+            if self.data and self.data.get("consumption_limit") is not None:
+                self.data["consumption_limit"]["is_active"] = active
+                self.data["consumption_limit"]["duration_seconds"] = duration
         except grpc.aio.AioRpcError as err:
             if _is_unimplemented(err):
                 self._lpc_supported = False
