@@ -92,22 +92,30 @@ func (s *MonitoringService) GetMeasurements(_ context.Context, req *pb.DeviceReq
 		for idx, value := range values {
 			appendMeasurement(&measurements, now, fmt.Sprintf("power_l%d", idx+1), value, "W")
 		}
+	} else {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readPowerPerPhase failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if values, err := s.readCurrentPerPhase(req.Ski); err == nil {
 		for idx, value := range values {
 			appendMeasurement(&measurements, now, fmt.Sprintf("current_l%d", idx+1), value, "A")
 		}
+	} else {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readCurrentPerPhase failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if values, err := s.readVoltagePerPhase(req.Ski); err == nil {
 		for idx, value := range values {
 			appendMeasurement(&measurements, now, fmt.Sprintf("voltage_l%d", idx+1), value, "V")
 		}
+	} else {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readVoltagePerPhase failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if value, err := s.readFrequency(req.Ski); err == nil {
 		appendMeasurement(&measurements, now, "frequency", value, "Hz")
+	} else {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readFrequency failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if value, err := s.readEnergyConsumed(req.Ski); err == nil {
@@ -271,14 +279,27 @@ func (s *MonitoringService) readEnergyProduced(ski string) (float64, error) {
 func (s *MonitoringService) readPowerPerPhase(ski string) ([]float64, error) {
 	entity, err := s.resolveEntity(ski)
 	if err == nil {
-		return s.monitoring.PowerPerPhase(entity)
+		values, readErr := s.monitoring.PowerPerPhase(entity)
+		if readErr != nil {
+			log.Printf("[DEBUG] Monitoring.readPowerPerPhase entity read failed: requested_ski=%s err=%v", ski, readErr)
+			return nil, readErr
+		}
+		if len(values) == 0 {
+			log.Printf("[DEBUG] Monitoring.readPowerPerPhase entity returned empty: requested_ski=%s", ski)
+		}
+		return values, nil
 	}
 	if status.Code(err) != codes.NotFound {
 		return nil, err
 	}
+	log.Printf("[DEBUG] Monitoring.readPowerPerPhase attempting fallback: requested_ski=%s", ski)
 	values, fallbackErr := s.safePowerPerPhaseNilEntity()
 	if fallbackErr != nil {
+		log.Printf("[DEBUG] Monitoring.readPowerPerPhase fallback failed: requested_ski=%s err=%v", ski, fallbackErr)
 		return nil, err
+	}
+	if len(values) == 0 {
+		log.Printf("[DEBUG] Monitoring.readPowerPerPhase fallback returned empty: requested_ski=%s", ski)
 	}
 	return values, nil
 }
@@ -286,14 +307,27 @@ func (s *MonitoringService) readPowerPerPhase(ski string) ([]float64, error) {
 func (s *MonitoringService) readCurrentPerPhase(ski string) ([]float64, error) {
 	entity, err := s.resolveEntity(ski)
 	if err == nil {
-		return s.monitoring.CurrentPerPhase(entity)
+		values, readErr := s.monitoring.CurrentPerPhase(entity)
+		if readErr != nil {
+			log.Printf("[DEBUG] Monitoring.readCurrentPerPhase entity read failed: requested_ski=%s err=%v", ski, readErr)
+			return nil, readErr
+		}
+		if len(values) == 0 {
+			log.Printf("[DEBUG] Monitoring.readCurrentPerPhase entity returned empty: requested_ski=%s", ski)
+		}
+		return values, nil
 	}
 	if status.Code(err) != codes.NotFound {
 		return nil, err
 	}
+	log.Printf("[DEBUG] Monitoring.readCurrentPerPhase attempting fallback: requested_ski=%s", ski)
 	values, fallbackErr := s.safeCurrentPerPhaseNilEntity()
 	if fallbackErr != nil {
+		log.Printf("[DEBUG] Monitoring.readCurrentPerPhase fallback failed: requested_ski=%s err=%v", ski, fallbackErr)
 		return nil, err
+	}
+	if len(values) == 0 {
+		log.Printf("[DEBUG] Monitoring.readCurrentPerPhase fallback returned empty: requested_ski=%s", ski)
 	}
 	return values, nil
 }
@@ -301,14 +335,27 @@ func (s *MonitoringService) readCurrentPerPhase(ski string) ([]float64, error) {
 func (s *MonitoringService) readVoltagePerPhase(ski string) ([]float64, error) {
 	entity, err := s.resolveEntity(ski)
 	if err == nil {
-		return s.monitoring.VoltagePerPhase(entity)
+		values, readErr := s.monitoring.VoltagePerPhase(entity)
+		if readErr != nil {
+			log.Printf("[DEBUG] Monitoring.readVoltagePerPhase entity read failed: requested_ski=%s err=%v", ski, readErr)
+			return nil, readErr
+		}
+		if len(values) == 0 {
+			log.Printf("[DEBUG] Monitoring.readVoltagePerPhase entity returned empty: requested_ski=%s", ski)
+		}
+		return values, nil
 	}
 	if status.Code(err) != codes.NotFound {
 		return nil, err
 	}
+	log.Printf("[DEBUG] Monitoring.readVoltagePerPhase attempting fallback: requested_ski=%s", ski)
 	values, fallbackErr := s.safeVoltagePerPhaseNilEntity()
 	if fallbackErr != nil {
+		log.Printf("[DEBUG] Monitoring.readVoltagePerPhase fallback failed: requested_ski=%s err=%v", ski, fallbackErr)
 		return nil, err
+	}
+	if len(values) == 0 {
+		log.Printf("[DEBUG] Monitoring.readVoltagePerPhase fallback returned empty: requested_ski=%s", ski)
 	}
 	return values, nil
 }
