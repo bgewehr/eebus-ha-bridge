@@ -8,10 +8,12 @@ import time
 from datetime import timedelta
 from typing import Any
 
+import aiohttp
 import grpc
 import grpc.aio
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 _LOGGER = logging.getLogger(__name__)
@@ -39,10 +41,6 @@ def _rpc_error_text(err: grpc.aio.AioRpcError) -> str:
     return f"code={err.code().name} details={err.details()}"
 
 
-def _normalize_ski(ski: str) -> str:
-    """Normalize SKI input to the compact uppercase representation used by the bridge."""
-    return ski.strip().replace(" ", "").upper()
-
 
 class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator that manages gRPC connection and data updates."""
@@ -63,14 +61,15 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.host = host
         self.port = port
-        self.ski = _normalize_ski(ski)
+        # SKI is normalized (strip + no spaces + uppercase) by the config flow
+        # before it is persisted in entry.data — no further processing needed here.
+        self.ski = ski
         if not self.ski:
             _LOGGER.warning(
-                "EEBUS coordinator initialized with empty/invalid SKI (raw input: %r); data updates will fail",
-                ski,
+                "EEBUS coordinator initialized with empty SKI; data updates will fail",
             )
         self._channel: grpc.aio.Channel | None = None
-        self._stream_tasks: list[asyncio.Task] = []
+        self._stream_tasks: list[asyncio.Task] = []  # reserved for future streaming use
         self._was_unavailable: bool = False
         self._heartbeat_supported: bool | None = None
         self._lpc_supported: bool | None = None
@@ -78,12 +77,13 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ski_registered: bool = False
         self._not_found_streak: int = 0
         self._last_lpc_write: float = 0.0
+        self._emsesp_url: str = ""
         # User-configured durations (in seconds). Defaults match previous hard-coded values.
         self.lpc_duration_seconds: int = 3600
         self.failsafe_duration_minimum_seconds: int = 7200
 
-    async def _ensure_channel(self) -> grpc.aio.Channel:
-        """Create or return existing gRPC channel."""
+    def _ensure_channel(self) -> grpc.aio.Channel:
+        """Return the shared gRPC channel, creating it on first call."""
         if self._channel is None:
             self._channel = grpc.aio.insecure_channel(f"{self.host}:{self.port}")
         return self._channel

@@ -89,7 +89,9 @@ class EebusConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            ski = user_input[CONF_DEVICE_SKI].strip().upper()
+            # Normalize before validation so the stored SKI is already canonical.
+            # SKIs are often displayed with spaces in documentation (e.g. "AB CD EF").
+            ski = user_input[CONF_DEVICE_SKI].strip().replace(" ", "").upper()
 
             if not ski:
                 errors["base"] = "invalid_ski_empty"
