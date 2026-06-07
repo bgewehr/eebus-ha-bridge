@@ -350,6 +350,21 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data["failsafe_supported"] = self._failsafe_supported
             data["read_fallback_used"] = used_fallback
 
+            # Read EMS-ESP pvmaxcomp to derive current SG-Ready mode.
+            # Don't let EMS-ESP errors fail the whole EEBUS poll.
+            pvmaxcomp = await self._async_read_emsesp_pvmaxcomp()
+            if pvmaxcomp is not None:
+                data["sg_ready_pvmaxcomp"] = pvmaxcomp
+                if pvmaxcomp <= 0:
+                    data["sg_ready_mode"] = "normal"
+                elif pvmaxcomp <= 15:
+                    data["sg_ready_mode"] = "encourage"
+                else:
+                    data["sg_ready_mode"] = "force"
+            else:
+                data["sg_ready_pvmaxcomp"] = self.data.get("sg_ready_pvmaxcomp") if self.data else None
+                data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
+
             # Only count toward the re-registration streak when BOTH core measurement
             # calls fail with NOT_FOUND.  If either succeeds the device is reachable;
             # triggering re-registration in that case causes a reconnection loop.
@@ -694,3 +709,97 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._channel is not None:
             await self._channel.close()
             self._channel = None
+
+    # ------------------------------------------------------------------
+    # EMS-ESP integration — SG-Ready control via pvmaxcomp
+    # ------------------------------------------------------------------
+    # SG-Ready mapping (Bosch Compress 5800i via EMS-ESP REST API):
+    #   Mode 2 Normal      → pvmaxcomp = 0   (WP runs by own logic)
+    #   Mode 3 Encourage   → pvmaxcomp = 15  (moderate PV surplus hint)
+    #   Mode 4 Force       → pvmaxcomp = 25  (max compressor + DHW one-time)
+    #
+    # EMS-ESP REST API: POST http://<host>/api/boiler
+    #   body: {"cmd": "pvmaxcomp", "value": <float>}
+    # No authentication needed (notoken_api = true).
+    # ------------------------------------------------------------------
+
+    def set_emsesp_url(self, url: str) -> None:
+        """Set the EMS-ESP base URL (e.g. 'http://ems-esp')."""
+        self._emsesp_url: str = url.rstrip("/") if url else ""
+
+    @property
+    def emsesp_url(self) -> str:
+        """Return the configured EMS-ESP base URL."""
+        return getattr(self, "_emsesp_url", "")
+
+    async def _emsesp_post(self, device: str, cmd: str, value: Any) -> None:
+        """POST a command to the EMS-ESP REST API."""
+        import aiohttp
+        url = f"{self.emsesp_url}/api/{device}"
+        payload = {"cmd": cmd, "value": value}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status not in (200, 204):
+                        text = await resp.text()
+                        _LOGGER.warning(
+                            "EMS-ESP POST %s %s=%s returned HTTP %s: %s",
+                            url, cmd, value, resp.status, text[:200],
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "EMS-ESP POST %s %s=%s → HTTP %s", url, cmd, value, resp.status
+                        )
+        except Exception as err:
+            _LOGGER.error("EMS-ESP POST %s failed: %s", url, err)
+            raise
+
+    async def async_set_sg_ready_mode(self, mode: str) -> None:
+        """Set SG-Ready mode via EMS-ESP pvmaxcomp.
+
+        mode: "normal" | "encourage" | "force"
+        """
+        if not self.emsesp_url:
+            raise ValueError("EMS-ESP URL not configured; set it via integration options")
+
+        mode_map: dict[str, float] = {
+            "normal": 0,
+            "encourage": 15,
+            "force": 25,
+        }
+        if mode not in mode_map:
+            raise ValueError(f"Invalid SG-Ready mode: {mode!r}. Must be one of {list(mode_map)}")
+
+        pvmaxcomp = mode_map[mode]
+        await self._emsesp_post("boiler", "pvmaxcomp", pvmaxcomp)
+
+        # For Force mode: also trigger DHW one-time heating to maximise thermal storage.
+        if mode == "force":
+            try:
+                await self._emsesp_post("boiler", "dhw/onetime", 1)
+            except Exception:
+                _LOGGER.warning("EMS-ESP DHW one-time heating trigger failed (non-fatal)")
+
+        # Optimistic update so the select entity shows the new state immediately.
+        if self.data is not None:
+            self.data["sg_ready_mode"] = mode
+            self.data["sg_ready_pvmaxcomp"] = pvmaxcomp
+
+    async def _async_read_emsesp_pvmaxcomp(self) -> float | None:
+        """Read current pvmaxcomp from EMS-ESP to determine SG-Ready state."""
+        if not self.emsesp_url:
+            return None
+        import aiohttp
+        url = f"{self.emsesp_url}/api/boiler/pvmaxcomp"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        # EMS-ESP returns {"api_data": <value>} or just the value
+                        if isinstance(data, dict):
+                            return float(data.get("api_data", data.get("value", 0)))
+                        return float(data)
+        except Exception as err:
+            _LOGGER.debug("EMS-ESP GET pvmaxcomp failed: %s", err)
+        return None

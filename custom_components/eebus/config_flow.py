@@ -9,10 +9,12 @@ import grpc
 import grpc.aio
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.core import callback
 
 from .const import (
     CONF_DEVICE_SKI,
+    CONF_EMSESP_URL,
     CONF_GRPC_HOST,
     CONF_GRPC_PORT,
     DEFAULT_GRPC_PORT,
@@ -155,4 +157,34 @@ class EebusConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):  # type: ignore[override]
+        """Return options flow."""
+        return EebusOptionsFlow()
+
+
+class EebusOptionsFlow(OptionsFlow):
+    """Options flow for configuring EMS-ESP integration."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current_url = self.config_entry.options.get(CONF_EMSESP_URL, "")
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_EMSESP_URL, default=current_url): str,
+                }
+            ),
+            description_placeholders={
+                "example": "http://ems-esp",
+            },
         )

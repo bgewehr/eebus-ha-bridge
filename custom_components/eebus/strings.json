@@ -75,6 +75,30 @@
       "connected": { "name": "Connected" },
       "heartbeat_ok": { "name": "Heartbeat OK" },
       "heat_pump_active": { "name": "Heat Pump Active" }
+    },
+    "select": {
+      "sg_ready_mode": {
+        "name": "SG-Ready Mode",
+        "state": {
+          "normal": "Normal (Mode 2)",
+          "encourage": "Encourage (Mode 3)",
+          "force": "Force (Mode 4)"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EEBUS Options",
+        "description": "Optional: configure EMS-ESP integration for SG-Ready mode control.",
+        "data": {
+          "emsesp_url": "EMS-ESP URL"
+        },
+        "data_description": {
+          "emsesp_url": "Base URL of your EMS-ESP instance (e.g. http://ems-esp). Leave empty to disable SG-Ready control."
+        }
+      }
     }
   }
 }
