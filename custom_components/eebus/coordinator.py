@@ -798,6 +798,22 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # The heat pump handles heating vs. DHW via its internal 3/4-way valve
             # and cannot do both simultaneously, so we pick DHW as the higher-value
             # thermal store during PV surplus.
+            #
+            # We also raise dhw/seltemp to the single-charge target (seltempsingle,
+            # typically 65 °C) so the WP always sees Soll > Ist — otherwise the pump
+            # may skip the one-time charge when the tank is already near seltemp.
+            #
+            # Snapshot base seltemp before overwriting it (needed for restore on normal).
+            if self._sg_ready_base_dhw_seltemp is None:
+                base = await self._async_read_emsesp_dhw_seltemp()
+                if base is not None:
+                    self._sg_ready_base_dhw_seltemp = base
+            single_temp = await self._async_read_emsesp_field("boiler", "dhw/seltempsingle")
+            if single_temp is not None:
+                _LOGGER.info(
+                    "SG-Ready force: raising dhw/seltemp to single-charge target %.1f °C", single_temp
+                )
+                await self._emsesp_post("boiler", "dhw/seltemp", single_temp)
             _LOGGER.info("SG-Ready force: sending dhw/onetime=1 to EMS-ESP")
             await self._emsesp_post("boiler", "dhw/onetime", True)
             _LOGGER.info("SG-Ready force: dhw/onetime sent successfully")
@@ -824,11 +840,11 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         _LOGGER.debug("SG-Ready mode set to %r (base_dhw_seltemp=%s)", mode, self._sg_ready_base_dhw_seltemp)
 
-    async def _async_read_emsesp_dhw_seltemp(self) -> float | None:
-        """Read the current boiler/dhw/seltemp from EMS-ESP."""
+    async def _async_read_emsesp_field(self, device: str, field: str) -> float | None:
+        """Read a numeric field from the EMS-ESP REST API."""
         if not self._emsesp_url:
             return None
-        url = f"{self._emsesp_url}/api/boiler/dhw/seltemp"
+        url = f"{self._emsesp_url}/api/{device}/{field}"
         session = async_get_clientsession(self.hass)
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -838,5 +854,9 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         return float(data.get("api_data", data.get("value", 0)))
                     return float(data)
         except Exception as err:
-            _LOGGER.debug("EMS-ESP GET boiler/dhw/seltemp failed: %s", err)
+            _LOGGER.debug("EMS-ESP GET %s/%s failed: %s", device, field, err)
         return None
+
+    async def _async_read_emsesp_dhw_seltemp(self) -> float | None:
+        """Read the current boiler/dhw/seltemp from EMS-ESP."""
+        return await self._async_read_emsesp_field("boiler", "dhw/seltemp")
