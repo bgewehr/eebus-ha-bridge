@@ -130,7 +130,8 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             monitoring_stub = proto_stubs.MonitoringServiceStub(channel)
             request = proto_stubs.DeviceRequest(ski=self.ski)
             used_fallback = False
-            saw_not_found = False
+            saw_power_not_found = False
+            saw_measurements_not_found = False
 
             try:
                 power = await monitoring_stub.GetPowerConsumption(
@@ -144,7 +145,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             except grpc.aio.AioRpcError as err:
                 if _is_not_found(err):
-                    saw_not_found = True
+                    saw_power_not_found = True
                     data["power_watts"] = None
                     _LOGGER.debug(
                         "EEBUS power read failed for SKI %s with NOT_FOUND (device may be re-registering)",
@@ -182,7 +183,9 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             except grpc.aio.AioRpcError as err:
                 if _is_not_found(err):
-                    saw_not_found = True
+                    saw_measurements_not_found = True
+                # NOT_FOUND here means individual measurements are unavailable;
+                # do not count toward streak on its own.
                 data["energy_consumed_heating_kwh"] = None
                 data["energy_consumed_dhw_kwh"] = None
                 _LOGGER.debug(
@@ -207,8 +210,8 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         energy.kilowatt_hours,
                     )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_not_found = True
+                # NOT_FOUND here means the device has no energy counter (e.g. heat pumps);
+                # do not count toward the re-registration streak.
                 data["energy_consumed_kwh"] = None
                 _LOGGER.debug(
                     "EEBUS total energy read failed for SKI %s: %s",
@@ -344,6 +347,10 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data["failsafe_supported"] = self._failsafe_supported
             data["read_fallback_used"] = used_fallback
 
+            # Only count toward the re-registration streak when BOTH core measurement
+            # calls fail with NOT_FOUND.  If either succeeds the device is reachable;
+            # triggering re-registration in that case causes a reconnection loop.
+            saw_not_found = saw_power_not_found and saw_measurements_not_found
             if saw_not_found:
                 self._not_found_streak += 1
             else:
