@@ -78,6 +78,9 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ski_registered: bool = False
         self._not_found_streak: int = 0
         self._last_lpc_write: float = 0.0
+        # User-configured durations (in seconds). Defaults match previous hard-coded values.
+        self.lpc_duration_seconds: int = 3600
+        self.failsafe_duration_minimum_seconds: int = 7200
 
     async def _ensure_channel(self) -> grpc.aio.Channel:
         """Create or return existing gRPC channel."""
@@ -519,7 +522,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await stub.WriteConsumptionLimit(
                 proto_stubs.WriteLoadLimitRequest(
                     ski=self.ski, value_watts=value_watts, is_active=True,
-                    duration_seconds=3600,
+                    duration_seconds=self.lpc_duration_seconds,
                 ),
                 timeout=RPC_TIMEOUT,
             )
@@ -538,14 +541,16 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
 
     async def async_write_failsafe_limit(self, value_watts: float) -> None:
-        """Write failsafe limit via gRPC."""
+        """Write failsafe limit watts via gRPC."""
         channel = await self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         try:
             await stub.WriteFailsafeLimit(
                 proto_stubs.WriteFailsafeLimitRequest(
-                    ski=self.ski, value_watts=value_watts
+                    ski=self.ski,
+                    value_watts=value_watts,
+                    duration_minimum_seconds=self.failsafe_duration_minimum_seconds,
                 ),
                 timeout=RPC_TIMEOUT,
             )
@@ -555,6 +560,47 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._failsafe_supported = False
                 _LOGGER.info(
                     "Failsafe write unsupported for SKI %s: %s", self.ski, err.details()
+                )
+                return
+            raise
+
+    async def async_write_lpc_duration(self, duration_seconds: int) -> None:
+        """Persist LPC limit duration (seconds). Applied on next WriteConsumptionLimit."""
+        self.lpc_duration_seconds = max(60, duration_seconds)
+
+    async def async_write_failsafe_duration(self, duration_minimum_seconds: int) -> None:
+        """Persist failsafe minimum duration (seconds) and write to device."""
+        # EEBUS spec mandates 2 h – 24 h.
+        clamped = max(7200, min(86400, duration_minimum_seconds))
+        self.failsafe_duration_minimum_seconds = clamped
+        channel = await self._ensure_channel()
+        from . import proto_stubs
+        stub = proto_stubs.LPCServiceStub(channel)
+        # Read current failsafe watts so we can send both fields together.
+        try:
+            current = await stub.GetFailsafeLimit(
+                proto_stubs.DeviceRequest(ski=self.ski), timeout=RPC_TIMEOUT
+            )
+            value_watts = current.value_watts
+        except grpc.aio.AioRpcError:
+            value_watts = 0.0
+        try:
+            await stub.WriteFailsafeLimit(
+                proto_stubs.WriteFailsafeLimitRequest(
+                    ski=self.ski,
+                    value_watts=value_watts,
+                    duration_minimum_seconds=clamped,
+                ),
+                timeout=RPC_TIMEOUT,
+            )
+            self._failsafe_supported = True
+            if self.data and self.data.get("failsafe_limit") is not None:
+                self.data["failsafe_limit"]["duration_minimum_seconds"] = clamped
+        except grpc.aio.AioRpcError as err:
+            if _is_unimplemented(err):
+                self._failsafe_supported = False
+                _LOGGER.info(
+                    "Failsafe duration write unsupported for SKI %s: %s", self.ski, err.details()
                 )
                 return
             raise
@@ -586,7 +632,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ski=self.ski,
                     value_watts=current.value_watts,
                     is_active=active,
-                    duration_seconds=3600,
+                    duration_seconds=self.lpc_duration_seconds,
                 ),
                 timeout=RPC_TIMEOUT,
             )

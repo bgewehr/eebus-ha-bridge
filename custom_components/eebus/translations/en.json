@@ -63,7 +63,9 @@
     },
     "number": {
       "lpc_limit": { "name": "LPC Limit" },
-      "failsafe_limit": { "name": "Failsafe Limit" }
+      "lpc_duration": { "name": "LPC Limit Duration" },
+      "failsafe_limit": { "name": "Failsafe Limit" },
+      "failsafe_duration": { "name": "Failsafe Minimum Duration" }
     },
     "switch": {
       "lpc_active": { "name": "LPC Active" },
