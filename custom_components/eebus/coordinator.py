@@ -133,34 +133,28 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             monitoring_stub = proto_stubs.MonitoringServiceStub(channel)
             request = proto_stubs.DeviceRequest(ski=self.ski)
             used_fallback = False
-            saw_power_not_found = False
-            saw_measurements_not_found = False
+            # True as soon as any SKI-specific gRPC call returns actual data.
+            # Any successful response proves the device is reachable.
+            any_call_succeeded = False
 
             try:
                 power = await monitoring_stub.GetPowerConsumption(
                     request, timeout=RPC_TIMEOUT
                 )
                 data["power_watts"] = power.watts
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS power read for SKI %s succeeded: watts=%s",
                     self.ski,
                     power.watts,
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_power_not_found = True
-                    data["power_watts"] = None
-                    _LOGGER.debug(
-                        "EEBUS power read failed for SKI %s with NOT_FOUND (device may be re-registering)",
-                        self.ski,
-                    )
-                else:
-                    data["power_watts"] = None
-                    _LOGGER.debug(
-                        "EEBUS power read failed for SKI %s: %s",
-                        self.ski,
-                        _rpc_error_text(err),
-                    )
+                data["power_watts"] = None
+                _LOGGER.debug(
+                    "EEBUS power read failed for SKI %s: %s",
+                    self.ski,
+                    _rpc_error_text(err),
+                )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to read power consumption")
                 data["power_watts"] = None
@@ -173,6 +167,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 scoped_energy = self._extract_scoped_energy_kwh(measurements.measurements)
                 data["energy_consumed_heating_kwh"] = scoped_energy["heating"]
                 data["energy_consumed_dhw_kwh"] = scoped_energy["dhw"]
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS measurement read for SKI %s: power=%s energy_total=%s energy_produced=%s freq=%s heating=%s dhw=%s entries=%s",
                     self.ski,
@@ -185,10 +180,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     len(measurements.measurements),
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_measurements_not_found = True
-                # NOT_FOUND here means individual measurements are unavailable;
-                # do not count toward streak on its own.
                 data["energy_consumed_heating_kwh"] = None
                 data["energy_consumed_dhw_kwh"] = None
                 _LOGGER.debug(
@@ -207,14 +198,13 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         request, timeout=RPC_TIMEOUT
                     )
                     data["energy_consumed_kwh"] = energy.kilowatt_hours
+                    any_call_succeeded = True
                     _LOGGER.debug(
                         "EEBUS total energy read for SKI %s succeeded: kWh=%s",
                         self.ski,
                         energy.kilowatt_hours,
                     )
             except grpc.aio.AioRpcError as err:
-                # NOT_FOUND here means the device has no energy counter (e.g. heat pumps);
-                # do not count toward the re-registration streak.
                 data["energy_consumed_kwh"] = None
                 _LOGGER.debug(
                     "EEBUS total energy read failed for SKI %s: %s",
@@ -248,6 +238,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 data["consumption_limit"] = polled_limit
                 self._lpc_supported = True
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS consumption limit read for SKI %s: value=%s active=%s changeable=%s",
                     self.ski,
@@ -275,6 +266,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "duration_minimum_seconds": failsafe.duration_minimum_seconds,
                 }
                 self._failsafe_supported = True
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS failsafe read for SKI %s: value=%s min_duration_s=%s",
                     self.ski,
@@ -302,6 +294,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 }
                 data["heartbeat_supported"] = True
                 self._heartbeat_supported = True
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS heartbeat status for SKI %s: running=%s within_duration=%s",
                     self.ski,
@@ -330,6 +323,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     request, timeout=RPC_TIMEOUT
                 )
                 data["consumption_nominal_max_watts"] = nominal_max.watts
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS nominal max consumption for SKI %s: watts=%s",
                     self.ski,
@@ -365,14 +359,13 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data["sg_ready_pvmaxcomp"] = self.data.get("sg_ready_pvmaxcomp") if self.data else None
                 data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
 
-            # Only count toward the re-registration streak when BOTH core measurement
-            # calls fail with NOT_FOUND.  If either succeeds the device is reachable;
-            # triggering re-registration in that case causes a reconnection loop.
-            saw_not_found = saw_power_not_found and saw_measurements_not_found
-            if saw_not_found:
-                self._not_found_streak += 1
-            else:
+            # Re-registration streak: any successful gRPC response proves the device
+            # is reachable — reset the streak.  Only increment when no call returned
+            # data at all, regardless of which specific measurements are available.
+            if any_call_succeeded:
                 self._not_found_streak = 0
+            else:
+                self._not_found_streak += 1
 
             if self._not_found_streak >= RE_REGISTER_NOT_FOUND_STREAK:
                 _LOGGER.warning(
