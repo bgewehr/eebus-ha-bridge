@@ -94,7 +94,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed("Device SKI is empty or invalid; check EEBUS integration configuration")
 
         try:
-            channel = await self._ensure_channel()
+            channel = self._ensure_channel()
             from . import proto_stubs
 
             device_stub = proto_stubs.DeviceServiceStub(channel)
@@ -131,8 +131,8 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
             monitoring_stub = proto_stubs.MonitoringServiceStub(channel)
+            lpc_stub = proto_stubs.LPCServiceStub(channel)
             request = proto_stubs.DeviceRequest(ski=self.ski)
-            used_fallback = False
             # True as soon as any SKI-specific gRPC call returns actual data.
             # Any successful response proves the device is reachable.
             any_call_succeeded = False
@@ -216,7 +216,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data["energy_consumed_kwh"] = None
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 limit = await lpc_stub.GetConsumptionLimit(
                     request, timeout=RPC_TIMEOUT
                 )
@@ -257,7 +256,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._lpc_supported = False
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 failsafe = await lpc_stub.GetFailsafeLimit(
                     request, timeout=RPC_TIMEOUT
                 )
@@ -284,7 +282,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._failsafe_supported = False
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 hb = await lpc_stub.GetHeartbeatStatus(
                     request, timeout=RPC_TIMEOUT
                 )
@@ -318,7 +315,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data["heartbeat_supported"] = self._heartbeat_supported
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 nominal_max = await lpc_stub.GetConsumptionNominalMax(
                     request, timeout=RPC_TIMEOUT
                 )
@@ -342,7 +338,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             data["lpc_supported"] = self._lpc_supported
             data["failsafe_supported"] = self._failsafe_supported
-            data["read_fallback_used"] = used_fallback
 
             # Read EMS-ESP pvmaxcomp to derive current SG-Ready mode.
             # Don't let EMS-ESP errors fail the whole EEBUS poll.
@@ -377,13 +372,12 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._not_found_streak = 0
 
             _LOGGER.debug(
-                "EEBUS poll summary for SKI %s: power=%s energy_total=%s energy_heating=%s energy_dhw=%s fallback=%s",
+                "EEBUS poll summary for SKI %s: power=%s energy_total=%s energy_heating=%s energy_dhw=%s",
                 self.ski,
                 data["power_watts"],
                 data["energy_consumed_kwh"],
                 data["energy_consumed_heating_kwh"],
                 data["energy_consumed_dhw_kwh"],
-                used_fallback,
             )
 
             if self._was_unavailable:
@@ -514,7 +508,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_write_lpc_limit(self, value_watts: float) -> None:
         """Write LPC consumption limit via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         # Set optimistic state BEFORE gRPC calls so any concurrent coordinator
@@ -550,7 +544,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_write_failsafe_limit(self, value_watts: float) -> None:
         """Write failsafe limit watts via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         try:
@@ -581,7 +575,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # EEBUS spec mandates 2 h – 24 h.
         clamped = max(7200, min(86400, duration_minimum_seconds))
         self.failsafe_duration_minimum_seconds = clamped
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         # Read current failsafe watts so we can send both fields together.
@@ -615,7 +609,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_set_lpc_active(self, active: bool) -> None:
         """Activate or deactivate LPC limit via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         # Optimistically update is_active BEFORE any gRPC call so concurrent
@@ -660,7 +654,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_start_heartbeat(self) -> None:
         """Start EEBUS heartbeat via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         try:
@@ -678,7 +672,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_stop_heartbeat(self) -> None:
         """Stop EEBUS heartbeat via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         try:
@@ -718,31 +712,32 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def set_emsesp_url(self, url: str) -> None:
         """Set the EMS-ESP base URL (e.g. 'http://ems-esp')."""
-        self._emsesp_url: str = url.rstrip("/") if url else ""
+        self._emsesp_url = url.rstrip("/") if url else ""
 
     @property
     def emsesp_url(self) -> str:
         """Return the configured EMS-ESP base URL."""
-        return getattr(self, "_emsesp_url", "")
+        return self._emsesp_url
 
     async def _emsesp_post(self, device: str, cmd: str, value: Any) -> None:
         """POST a command to the EMS-ESP REST API."""
-        import aiohttp
-        url = f"{self.emsesp_url}/api/{device}"
+        url = f"{self._emsesp_url}/api/{device}"
         payload = {"cmd": cmd, "value": value}
+        session = async_get_clientsession(self.hass)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status not in (200, 204):
-                        text = await resp.text()
-                        _LOGGER.warning(
-                            "EMS-ESP POST %s %s=%s returned HTTP %s: %s",
-                            url, cmd, value, resp.status, text[:200],
-                        )
-                    else:
-                        _LOGGER.debug(
-                            "EMS-ESP POST %s %s=%s → HTTP %s", url, cmd, value, resp.status
-                        )
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status not in (200, 204):
+                    text = await resp.text()
+                    _LOGGER.warning(
+                        "EMS-ESP POST %s %s=%s returned HTTP %s: %s",
+                        url, cmd, value, resp.status, text[:200],
+                    )
+                else:
+                    _LOGGER.debug(
+                        "EMS-ESP POST %s %s=%s → HTTP %s", url, cmd, value, resp.status
+                    )
         except Exception as err:
             _LOGGER.error("EMS-ESP POST %s failed: %s", url, err)
             raise
@@ -752,7 +747,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         mode: "normal" | "encourage" | "force"
         """
-        if not self.emsesp_url:
+        if not self._emsesp_url:
             raise ValueError("EMS-ESP URL not configured; set it via integration options")
 
         mode_map: dict[str, float] = {
@@ -780,19 +775,18 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_read_emsesp_pvmaxcomp(self) -> float | None:
         """Read current pvmaxcomp from EMS-ESP to determine SG-Ready state."""
-        if not self.emsesp_url:
+        if not self._emsesp_url:
             return None
-        import aiohttp
-        url = f"{self.emsesp_url}/api/boiler/pvmaxcomp"
+        url = f"{self._emsesp_url}/api/boiler/pvmaxcomp"
+        session = async_get_clientsession(self.hass)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        # EMS-ESP returns {"api_data": <value>} or just the value
-                        if isinstance(data, dict):
-                            return float(data.get("api_data", data.get("value", 0)))
-                        return float(data)
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    # EMS-ESP returns {"api_data": <value>} or just the value
+                    if isinstance(data, dict):
+                        return float(data.get("api_data", data.get("value", 0)))
+                    return float(data)
         except Exception as err:
             _LOGGER.debug("EMS-ESP GET pvmaxcomp failed: %s", err)
         return None

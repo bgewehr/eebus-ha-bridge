@@ -15,12 +15,15 @@ from homeassistant.const import (
     UnitOfEnergy,
     UnitOfFrequency,
     UnitOfPower,
+    UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import EebusCoordinator
 from .entity import EebusEntity
+
+PARALLEL_UPDATES = 0  # Coordinator-based, no per-entity polling
 
 
 async def async_setup_entry(
@@ -187,6 +190,7 @@ class EebusConsumptionLimitSensor(EebusEntity, SensorEntity):
 class EebusFrequencySensor(EebusEntity, SensorEntity):
     """Sensor for grid frequency."""
 
+    _attr_device_class = SensorDeviceClass.FREQUENCY
     _attr_native_unit_of_measurement = UnitOfFrequency.HERTZ
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "grid_frequency"
@@ -264,6 +268,7 @@ class EebusPowerL3Sensor(EebusEntity, SensorEntity):
 class EebusCurrentL1Sensor(EebusEntity, SensorEntity):
     """Sensor for phase L1 current."""
 
+    _attr_device_class = SensorDeviceClass.CURRENT
     _attr_native_unit_of_measurement = UnitOfElectricCurrent.AMPERE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "current_l1"
@@ -282,6 +287,7 @@ class EebusCurrentL1Sensor(EebusEntity, SensorEntity):
 class EebusCurrentL2Sensor(EebusEntity, SensorEntity):
     """Sensor for phase L2 current."""
 
+    _attr_device_class = SensorDeviceClass.CURRENT
     _attr_native_unit_of_measurement = UnitOfElectricCurrent.AMPERE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "current_l2"
@@ -300,6 +306,7 @@ class EebusCurrentL2Sensor(EebusEntity, SensorEntity):
 class EebusCurrentL3Sensor(EebusEntity, SensorEntity):
     """Sensor for phase L3 current."""
 
+    _attr_device_class = SensorDeviceClass.CURRENT
     _attr_native_unit_of_measurement = UnitOfElectricCurrent.AMPERE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "current_l3"
@@ -318,6 +325,7 @@ class EebusCurrentL3Sensor(EebusEntity, SensorEntity):
 class EebusVoltageL1Sensor(EebusEntity, SensorEntity):
     """Sensor for phase L1 voltage."""
 
+    _attr_device_class = SensorDeviceClass.VOLTAGE
     _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "voltage_l1"
@@ -336,6 +344,7 @@ class EebusVoltageL1Sensor(EebusEntity, SensorEntity):
 class EebusVoltageL2Sensor(EebusEntity, SensorEntity):
     """Sensor for phase L2 voltage."""
 
+    _attr_device_class = SensorDeviceClass.VOLTAGE
     _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "voltage_l2"
@@ -354,6 +363,7 @@ class EebusVoltageL2Sensor(EebusEntity, SensorEntity):
 class EebusVoltageL3Sensor(EebusEntity, SensorEntity):
     """Sensor for phase L3 voltage."""
 
+    _attr_device_class = SensorDeviceClass.VOLTAGE
     _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "voltage_l3"
@@ -392,7 +402,8 @@ class EebusNominalMaxPowerSensor(EebusEntity, SensorEntity):
 class EebusLimitDurationSensor(EebusEntity, SensorEntity):
     """Sensor showing remaining active limit time (countdown from device)."""
 
-    _attr_native_unit_of_measurement = "s"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_translation_key = "limit_duration"
     _attr_entity_category = EntityCategory.DIAGNOSTIC

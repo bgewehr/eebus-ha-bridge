@@ -43,7 +43,6 @@ class EebusConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for EEBUS."""
 
     VERSION = 1
-    DOMAIN = DOMAIN
 
     def __init__(self) -> None:
         """Initialize."""
