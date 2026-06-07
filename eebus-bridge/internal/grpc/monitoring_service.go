@@ -20,11 +20,11 @@ import (
 
 type MonitoringService struct {
 	pb.UnimplementedMonitoringServiceServer
-	monitoring          *usecases.MonitoringWrapper
-	bus                 *eebus.EventBus
-	registry            *eebus.DeviceRegistry
-	debugProtocol       bool
-	rawDumpDoneSKIs     map[string]bool
+	monitoring      *usecases.MonitoringWrapper
+	bus             *eebus.EventBus
+	registry        *eebus.DeviceRegistry
+	debugProtocol   bool
+	rawDumpDoneSKIs map[string]bool
 }
 
 func NewMonitoringService(monitoring *usecases.MonitoringWrapper, bus *eebus.EventBus, registry *eebus.DeviceRegistry, debugProtocol bool) *MonitoringService {
