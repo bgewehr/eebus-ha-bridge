@@ -39,6 +39,14 @@ func (w *MonitoringWrapper) UseCase() *mampc.MPC {
 	return w.uc
 }
 
+// LocalEntity returns the local SPINE entity used by the MPC use case.
+func (w *MonitoringWrapper) LocalEntity() spineapi.EntityLocalInterface {
+	if w.uc == nil {
+		return nil
+	}
+	return w.uc.LocalEntity
+}
+
 // HandleEvent is the api.EntityEventCallback passed to eebus-go. It translates
 // eebus-go event types to internal EventBus events.
 func (w *MonitoringWrapper) HandleEvent(ski string, device spineapi.DeviceRemoteInterface, entity spineapi.EntityRemoteInterface, event eebusapi.EventType) {

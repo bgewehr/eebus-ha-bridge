@@ -73,7 +73,8 @@
     },
     "binary_sensor": {
       "connected": { "name": "Connected" },
-      "heartbeat_ok": { "name": "Heartbeat OK" }
+      "heartbeat_ok": { "name": "Heartbeat OK" },
+      "heat_pump_active": { "name": "Heat Pump Active" }
     }
   }
 }
