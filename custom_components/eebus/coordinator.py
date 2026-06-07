@@ -8,10 +8,12 @@ import time
 from datetime import timedelta
 from typing import Any
 
+import aiohttp
 import grpc
 import grpc.aio
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,19 +31,10 @@ def _is_unimplemented(err: grpc.aio.AioRpcError) -> bool:
     return err.code() == grpc.StatusCode.UNIMPLEMENTED
 
 
-def _is_not_found(err: grpc.aio.AioRpcError) -> bool:
-    """Return True when gRPC reports missing entity/data for requested SKI."""
-    return err.code() == grpc.StatusCode.NOT_FOUND
-
-
 def _rpc_error_text(err: grpc.aio.AioRpcError) -> str:
     """Build compact debug output for gRPC errors."""
     return f"code={err.code().name} details={err.details()}"
 
-
-def _normalize_ski(ski: str) -> str:
-    """Normalize SKI input to the compact uppercase representation used by the bridge."""
-    return ski.strip().replace(" ", "").upper()
 
 
 class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -63,14 +56,15 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.host = host
         self.port = port
-        self.ski = _normalize_ski(ski)
+        # SKI is normalized (strip + no spaces + uppercase) by the config flow
+        # before it is persisted in entry.data — no further processing needed here.
+        self.ski = ski
         if not self.ski:
             _LOGGER.warning(
-                "EEBUS coordinator initialized with empty/invalid SKI (raw input: %r); data updates will fail",
-                ski,
+                "EEBUS coordinator initialized with empty SKI; data updates will fail",
             )
         self._channel: grpc.aio.Channel | None = None
-        self._stream_tasks: list[asyncio.Task] = []
+        self._stream_tasks: list[asyncio.Task] = []  # reserved for future streaming use
         self._was_unavailable: bool = False
         self._heartbeat_supported: bool | None = None
         self._lpc_supported: bool | None = None
@@ -78,12 +72,13 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ski_registered: bool = False
         self._not_found_streak: int = 0
         self._last_lpc_write: float = 0.0
+        self._emsesp_url: str = ""
         # User-configured durations (in seconds). Defaults match previous hard-coded values.
         self.lpc_duration_seconds: int = 3600
         self.failsafe_duration_minimum_seconds: int = 7200
 
-    async def _ensure_channel(self) -> grpc.aio.Channel:
-        """Create or return existing gRPC channel."""
+    def _ensure_channel(self) -> grpc.aio.Channel:
+        """Return the shared gRPC channel, creating it on first call."""
         if self._channel is None:
             self._channel = grpc.aio.insecure_channel(f"{self.host}:{self.port}")
         return self._channel
@@ -94,14 +89,14 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed("Device SKI is empty or invalid; check EEBUS integration configuration")
 
         try:
-            channel = await self._ensure_channel()
+            channel = self._ensure_channel()
             from . import proto_stubs
 
             device_stub = proto_stubs.DeviceServiceStub(channel)
             status = await device_stub.GetStatus(proto_stubs.Empty())
 
             if not self._ski_registered:
-                await self._async_register_remote_ski(device_stub, proto_stubs, force=False)
+                await self._async_register_remote_ski(device_stub, force=False)
 
             data: dict[str, Any] = {
                 "connected": status.running,
@@ -131,36 +126,30 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
             monitoring_stub = proto_stubs.MonitoringServiceStub(channel)
+            lpc_stub = proto_stubs.LPCServiceStub(channel)
             request = proto_stubs.DeviceRequest(ski=self.ski)
-            used_fallback = False
-            saw_power_not_found = False
-            saw_measurements_not_found = False
+            # True as soon as any SKI-specific gRPC call returns actual data.
+            # Any successful response proves the device is reachable.
+            any_call_succeeded = False
 
             try:
                 power = await monitoring_stub.GetPowerConsumption(
                     request, timeout=RPC_TIMEOUT
                 )
                 data["power_watts"] = power.watts
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS power read for SKI %s succeeded: watts=%s",
                     self.ski,
                     power.watts,
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_power_not_found = True
-                    data["power_watts"] = None
-                    _LOGGER.debug(
-                        "EEBUS power read failed for SKI %s with NOT_FOUND (device may be re-registering)",
-                        self.ski,
-                    )
-                else:
-                    data["power_watts"] = None
-                    _LOGGER.debug(
-                        "EEBUS power read failed for SKI %s: %s",
-                        self.ski,
-                        _rpc_error_text(err),
-                    )
+                data["power_watts"] = None
+                _LOGGER.debug(
+                    "EEBUS power read failed for SKI %s: %s",
+                    self.ski,
+                    _rpc_error_text(err),
+                )
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Failed to read power consumption")
                 data["power_watts"] = None
@@ -173,6 +162,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 scoped_energy = self._extract_scoped_energy_kwh(measurements.measurements)
                 data["energy_consumed_heating_kwh"] = scoped_energy["heating"]
                 data["energy_consumed_dhw_kwh"] = scoped_energy["dhw"]
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS measurement read for SKI %s: power=%s energy_total=%s energy_produced=%s freq=%s heating=%s dhw=%s entries=%s",
                     self.ski,
@@ -185,10 +175,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     len(measurements.measurements),
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_measurements_not_found = True
-                # NOT_FOUND here means individual measurements are unavailable;
-                # do not count toward streak on its own.
                 data["energy_consumed_heating_kwh"] = None
                 data["energy_consumed_dhw_kwh"] = None
                 _LOGGER.debug(
@@ -207,14 +193,13 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         request, timeout=RPC_TIMEOUT
                     )
                     data["energy_consumed_kwh"] = energy.kilowatt_hours
+                    any_call_succeeded = True
                     _LOGGER.debug(
                         "EEBUS total energy read for SKI %s succeeded: kWh=%s",
                         self.ski,
                         energy.kilowatt_hours,
                     )
             except grpc.aio.AioRpcError as err:
-                # NOT_FOUND here means the device has no energy counter (e.g. heat pumps);
-                # do not count toward the re-registration streak.
                 data["energy_consumed_kwh"] = None
                 _LOGGER.debug(
                     "EEBUS total energy read failed for SKI %s: %s",
@@ -226,7 +211,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data["energy_consumed_kwh"] = None
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 limit = await lpc_stub.GetConsumptionLimit(
                     request, timeout=RPC_TIMEOUT
                 )
@@ -248,6 +232,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 data["consumption_limit"] = polled_limit
                 self._lpc_supported = True
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS consumption limit read for SKI %s: value=%s active=%s changeable=%s",
                     self.ski,
@@ -266,7 +251,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._lpc_supported = False
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 failsafe = await lpc_stub.GetFailsafeLimit(
                     request, timeout=RPC_TIMEOUT
                 )
@@ -275,6 +259,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "duration_minimum_seconds": failsafe.duration_minimum_seconds,
                 }
                 self._failsafe_supported = True
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS failsafe read for SKI %s: value=%s min_duration_s=%s",
                     self.ski,
@@ -292,7 +277,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._failsafe_supported = False
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 hb = await lpc_stub.GetHeartbeatStatus(
                     request, timeout=RPC_TIMEOUT
                 )
@@ -302,6 +286,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 }
                 data["heartbeat_supported"] = True
                 self._heartbeat_supported = True
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS heartbeat status for SKI %s: running=%s within_duration=%s",
                     self.ski,
@@ -325,11 +310,11 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data["heartbeat_supported"] = self._heartbeat_supported
 
             try:
-                lpc_stub = proto_stubs.LPCServiceStub(channel)
                 nominal_max = await lpc_stub.GetConsumptionNominalMax(
                     request, timeout=RPC_TIMEOUT
                 )
                 data["consumption_nominal_max_watts"] = nominal_max.watts
+                any_call_succeeded = True
                 _LOGGER.debug(
                     "EEBUS nominal max consumption for SKI %s: watts=%s",
                     self.ski,
@@ -348,16 +333,29 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             data["lpc_supported"] = self._lpc_supported
             data["failsafe_supported"] = self._failsafe_supported
-            data["read_fallback_used"] = used_fallback
 
-            # Only count toward the re-registration streak when BOTH core measurement
-            # calls fail with NOT_FOUND.  If either succeeds the device is reachable;
-            # triggering re-registration in that case causes a reconnection loop.
-            saw_not_found = saw_power_not_found and saw_measurements_not_found
-            if saw_not_found:
-                self._not_found_streak += 1
+            # Read EMS-ESP pvmaxcomp to derive current SG-Ready mode.
+            # Don't let EMS-ESP errors fail the whole EEBUS poll.
+            pvmaxcomp = await self._async_read_emsesp_pvmaxcomp()
+            if pvmaxcomp is not None:
+                data["sg_ready_pvmaxcomp"] = pvmaxcomp
+                if pvmaxcomp <= 0:
+                    data["sg_ready_mode"] = "normal"
+                elif pvmaxcomp <= 15:
+                    data["sg_ready_mode"] = "encourage"
+                else:
+                    data["sg_ready_mode"] = "force"
             else:
+                data["sg_ready_pvmaxcomp"] = self.data.get("sg_ready_pvmaxcomp") if self.data else None
+                data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
+
+            # Re-registration streak: any successful gRPC response proves the device
+            # is reachable — reset the streak.  Only increment when no call returned
+            # data at all, regardless of which specific measurements are available.
+            if any_call_succeeded:
                 self._not_found_streak = 0
+            else:
+                self._not_found_streak += 1
 
             if self._not_found_streak >= RE_REGISTER_NOT_FOUND_STREAK:
                 _LOGGER.warning(
@@ -365,17 +363,16 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._not_found_streak,
                     self.ski,
                 )
-                await self._async_register_remote_ski(device_stub, proto_stubs, force=True)
+                await self._async_register_remote_ski(device_stub, force=True)
                 self._not_found_streak = 0
 
             _LOGGER.debug(
-                "EEBUS poll summary for SKI %s: power=%s energy_total=%s energy_heating=%s energy_dhw=%s fallback=%s",
+                "EEBUS poll summary for SKI %s: power=%s energy_total=%s energy_heating=%s energy_dhw=%s",
                 self.ski,
                 data["power_watts"],
                 data["energy_consumed_kwh"],
                 data["energy_consumed_heating_kwh"],
                 data["energy_consumed_dhw_kwh"],
-                used_fallback,
             )
 
             if self._was_unavailable:
@@ -398,24 +395,20 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"gRPC error: {err}") from err
 
     async def _async_register_remote_ski(
-        self, device_stub: Any, proto_stubs: Any, force: bool
+        self, device_stub: Any, force: bool
     ) -> None:
         """Register remote SKI with bridge, optionally forcing re-registration."""
+        from . import proto_stubs
         try:
-            register_request_cls = getattr(proto_stubs, "RegisterSKIRequest", None)
-            if register_request_cls is None:
-                from .generated.eebus.v1.device_service_pb2 import (
-                    RegisterSKIRequest as register_request_cls,
-                )
-
             await device_stub.RegisterRemoteSKI(
-                register_request_cls(ski=self.ski), timeout=RPC_TIMEOUT
+                proto_stubs.RegisterSKIRequest(ski=self.ski), timeout=RPC_TIMEOUT
             )
             self._ski_registered = True
-            if force:
-                _LOGGER.info("Forced re-registration of remote SKI %s with bridge", self.ski)
-            else:
-                _LOGGER.info("Registered remote SKI %s with bridge", self.ski)
+            _LOGGER.info(
+                "%s remote SKI %s with bridge",
+                "Forced re-registration of" if force else "Registered",
+                self.ski,
+            )
         except grpc.aio.AioRpcError as err:
             if force:
                 _LOGGER.warning(
@@ -506,7 +499,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_write_lpc_limit(self, value_watts: float) -> None:
         """Write LPC consumption limit via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         # Set optimistic state BEFORE gRPC calls so any concurrent coordinator
@@ -542,7 +535,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_write_failsafe_limit(self, value_watts: float) -> None:
         """Write failsafe limit watts via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         try:
@@ -573,7 +566,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # EEBUS spec mandates 2 h – 24 h.
         clamped = max(7200, min(86400, duration_minimum_seconds))
         self.failsafe_duration_minimum_seconds = clamped
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         # Read current failsafe watts so we can send both fields together.
@@ -607,7 +600,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_set_lpc_active(self, active: bool) -> None:
         """Activate or deactivate LPC limit via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         # Optimistically update is_active BEFORE any gRPC call so concurrent
@@ -652,7 +645,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_start_heartbeat(self) -> None:
         """Start EEBUS heartbeat via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         try:
@@ -670,7 +663,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_stop_heartbeat(self) -> None:
         """Stop EEBUS heartbeat via gRPC."""
-        channel = await self._ensure_channel()
+        channel = self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
         try:
@@ -694,3 +687,97 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._channel is not None:
             await self._channel.close()
             self._channel = None
+
+    # ------------------------------------------------------------------
+    # EMS-ESP integration — SG-Ready control via pvmaxcomp
+    # ------------------------------------------------------------------
+    # SG-Ready mapping (Bosch Compress 5800i via EMS-ESP REST API):
+    #   Mode 2 Normal      → pvmaxcomp = 0   (WP runs by own logic)
+    #   Mode 3 Encourage   → pvmaxcomp = 15  (moderate PV surplus hint)
+    #   Mode 4 Force       → pvmaxcomp = 25  (max compressor + DHW one-time)
+    #
+    # EMS-ESP REST API: POST http://<host>/api/boiler
+    #   body: {"cmd": "pvmaxcomp", "value": <float>}
+    # No authentication needed (notoken_api = true).
+    # ------------------------------------------------------------------
+
+    def set_emsesp_url(self, url: str) -> None:
+        """Set the EMS-ESP base URL (e.g. 'http://ems-esp')."""
+        self._emsesp_url = url.rstrip("/") if url else ""
+
+    @property
+    def emsesp_url(self) -> str:
+        """Return the configured EMS-ESP base URL."""
+        return self._emsesp_url
+
+    async def _emsesp_post(self, device: str, cmd: str, value: Any) -> None:
+        """POST a command to the EMS-ESP REST API."""
+        url = f"{self._emsesp_url}/api/{device}"
+        payload = {"cmd": cmd, "value": value}
+        session = async_get_clientsession(self.hass)
+        try:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status not in (200, 204):
+                    text = await resp.text()
+                    _LOGGER.warning(
+                        "EMS-ESP POST %s %s=%s returned HTTP %s: %s",
+                        url, cmd, value, resp.status, text[:200],
+                    )
+                else:
+                    _LOGGER.debug(
+                        "EMS-ESP POST %s %s=%s → HTTP %s", url, cmd, value, resp.status
+                    )
+        except Exception as err:
+            _LOGGER.debug("EMS-ESP POST %s %s=%s failed: %s", url, cmd, value, err)
+            raise
+
+    async def async_set_sg_ready_mode(self, mode: str) -> None:
+        """Set SG-Ready mode via EMS-ESP pvmaxcomp.
+
+        mode: "normal" | "encourage" | "force"
+        """
+        if not self._emsesp_url:
+            raise ValueError("EMS-ESP URL not configured; set it via integration options")
+
+        mode_map: dict[str, float] = {
+            "normal": 0,
+            "encourage": 15,
+            "force": 25,
+        }
+        if mode not in mode_map:
+            raise ValueError(f"Invalid SG-Ready mode: {mode!r}. Must be one of {list(mode_map)}")
+
+        pvmaxcomp = mode_map[mode]
+        await self._emsesp_post("boiler", "pvmaxcomp", pvmaxcomp)
+
+        # For Force mode: also trigger DHW one-time heating to maximise thermal storage.
+        if mode == "force":
+            try:
+                await self._emsesp_post("boiler", "dhw/onetime", 1)
+            except Exception:
+                _LOGGER.warning("EMS-ESP DHW one-time heating trigger failed (non-fatal)")
+
+        # Optimistic update so the select entity shows the new state immediately.
+        if self.data is not None:
+            self.data["sg_ready_mode"] = mode
+            self.data["sg_ready_pvmaxcomp"] = pvmaxcomp
+
+    async def _async_read_emsesp_pvmaxcomp(self) -> float | None:
+        """Read current pvmaxcomp from EMS-ESP to determine SG-Ready state."""
+        if not self._emsesp_url:
+            return None
+        url = f"{self._emsesp_url}/api/boiler/pvmaxcomp"
+        session = async_get_clientsession(self.hass)
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    # EMS-ESP returns {"api_data": <value>} or just the value
+                    if isinstance(data, dict):
+                        return float(data.get("api_data", data.get("value", 0)))
+                    return float(data)
+        except Exception as err:
+            _LOGGER.debug("EMS-ESP GET pvmaxcomp failed: %s", err)
+        return None

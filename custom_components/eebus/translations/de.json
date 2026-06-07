@@ -73,7 +73,32 @@
     },
     "binary_sensor": {
       "connected": { "name": "Verbunden" },
-      "heartbeat_ok": { "name": "Heartbeat OK" }
+      "heartbeat_ok": { "name": "Heartbeat OK" },
+      "heat_pump_active": { "name": "Wärmepumpe aktiv" }
+    },
+    "select": {
+      "sg_ready_mode": {
+        "name": "SG-Ready Modus",
+        "state": {
+          "normal": "Normal (Modus 2)",
+          "encourage": "Einschaltempfehlung (Modus 3)",
+          "force": "Einschaltbefehl (Modus 4)"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EEBUS Optionen",
+        "description": "Optional: EMS-ESP Integration für SG-Ready Modus konfigurieren.",
+        "data": {
+          "emsesp_url": "EMS-ESP URL"
+        },
+        "data_description": {
+          "emsesp_url": "Basis-URL des EMS-ESP (z.B. http://ems-esp). Leer lassen, um SG-Ready-Steuerung zu deaktivieren."
+        }
+      }
     }
   }
 }

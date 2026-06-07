@@ -6,7 +6,9 @@ import (
 	"log"
 	"strings"
 
+	eebusclient "github.com/enbility/eebus-go/features/client"
 	spineapi "github.com/enbility/spine-go/api"
+	"github.com/enbility/spine-go/model"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/volschin/eebus-bridge/gen/proto/eebus/v1"
@@ -18,14 +20,21 @@ import (
 
 type MonitoringService struct {
 	pb.UnimplementedMonitoringServiceServer
-	monitoring       *usecases.MonitoringWrapper
-	bus              *eebus.EventBus
-	registry         *eebus.DeviceRegistry
-	debugProtocol    bool
+	monitoring      *usecases.MonitoringWrapper
+	bus             *eebus.EventBus
+	registry        *eebus.DeviceRegistry
+	debugProtocol   bool
+	rawDumpDoneSKIs map[string]bool
 }
 
 func NewMonitoringService(monitoring *usecases.MonitoringWrapper, bus *eebus.EventBus, registry *eebus.DeviceRegistry, debugProtocol bool) *MonitoringService {
-	return &MonitoringService{monitoring: monitoring, bus: bus, registry: registry, debugProtocol: debugProtocol}
+	return &MonitoringService{
+		monitoring:      monitoring,
+		bus:             bus,
+		registry:        registry,
+		debugProtocol:   debugProtocol,
+		rawDumpDoneSKIs: make(map[string]bool),
+	}
 }
 
 func (s *MonitoringService) GetPowerConsumption(_ context.Context, req *pb.DeviceRequest) (*pb.PowerMeasurement, error) {
@@ -203,7 +212,55 @@ func (s *MonitoringService) resolveEntity(ski string) (spineapi.EntityRemoteInte
 		log.Printf("[DEBUG] Monitoring.resolveEntity no entity for requested SKI: requested_ski=%s", ski)
 		return nil, status.Errorf(codes.NotFound, "no remote entity found for ski %s", ski)
 	}
+	// On first successful entity resolution per SKI, dump all raw SPINE measurement
+	// descriptions the device advertises. This reveals exactly which measurement types
+	// the device supports regardless of use-case filtering — useful for diagnostics and
+	// investigating future firmware updates.
+	if s.debugProtocol && !s.rawDumpDoneSKIs[ski] {
+		s.rawDumpDoneSKIs[ski] = true
+		go s.dumpRawMeasurementDescriptions(ski, entity)
+	}
 	return entity, nil
+}
+
+// dumpRawMeasurementDescriptions logs every MeasurementDescription the remote device
+// has advertised via SPINE, regardless of which eebus-go use case supports it.
+// Run in a goroutine so it does not block the calling RPC.
+func (s *MonitoringService) dumpRawMeasurementDescriptions(ski string, entity spineapi.EntityRemoteInterface) {
+	if s.monitoring == nil || s.monitoring.LocalEntity() == nil {
+		return
+	}
+	mc, err := eebusclient.NewMeasurement(s.monitoring.LocalEntity(), entity)
+	if err != nil {
+		log.Printf("[PROTOCOL] raw-dump: could not create measurement client for SKI=%s: %v", ski, err)
+		return
+	}
+	descs, err := mc.GetDescriptionsForFilter(model.MeasurementDescriptionDataType{})
+	if err != nil || len(descs) == 0 {
+		log.Printf("[PROTOCOL] raw-dump: no measurement descriptions available for SKI=%s (err=%v)", ski, err)
+		return
+	}
+	log.Printf("[PROTOCOL] raw-dump: SKI=%s advertises %d SPINE measurement description(s):", ski, len(descs))
+	for _, d := range descs {
+		mtype := ""
+		if d.MeasurementType != nil {
+			mtype = string(*d.MeasurementType)
+		}
+		commodity := ""
+		if d.CommodityType != nil {
+			commodity = string(*d.CommodityType)
+		}
+		scope := ""
+		if d.ScopeType != nil {
+			scope = string(*d.ScopeType)
+		}
+		unit := ""
+		if d.Unit != nil {
+			unit = string(*d.Unit)
+		}
+		log.Printf("[PROTOCOL]   type=%-20s commodity=%-15s scope=%-30s unit=%s",
+			mtype, commodity, scope, unit)
+	}
 }
 
 func (s *MonitoringService) readPower(ski string) (float64, error) {

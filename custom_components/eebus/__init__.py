@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_DEVICE_SKI, CONF_GRPC_HOST, CONF_GRPC_PORT, PLATFORMS
+from .const import CONF_DEVICE_SKI, CONF_EMSESP_URL, CONF_GRPC_HOST, CONF_GRPC_PORT, PLATFORMS
 from .coordinator import EebusCoordinator
 
 if TYPE_CHECKING:
@@ -24,6 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EebusConfigEntry) -> boo
         port=entry.data[CONF_GRPC_PORT],
         ski=entry.data[CONF_DEVICE_SKI],
     )
+    coordinator.set_emsesp_url(entry.options.get(CONF_EMSESP_URL, ""))
     await coordinator.async_config_entry_first_refresh()
 
     entry.runtime_data = coordinator
