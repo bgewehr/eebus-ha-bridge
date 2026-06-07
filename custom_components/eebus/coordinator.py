@@ -24,17 +24,15 @@ RE_REGISTER_NOT_FOUND_STREAK = 4
 # After a LPC write, protect the optimistic is_active state for this many seconds
 # to prevent the next coordinator poll from reverting it before the device confirms.
 LPC_WRITE_PROTECTION_SECS = 8.0
+# After a SG-Ready mode write, protect the optimistic sg_ready_mode for this many
+# seconds.  The thermostat may take several seconds to confirm the new value.
+SG_READY_WRITE_PROTECTION_SECS = 15.0
 
-# pvmaxcomp thresholds for SG-Ready mode detection.
-# The Bosch Compress 5800i idles at ≈ 1.5 (not 0), so "normal" covers [0, 5).
-_SG_READY_NORMAL_MAX: float = 5.0    # pvmaxcomp < this  → "normal"
-_SG_READY_FORCE_MIN: float = 20.0    # pvmaxcomp >= this → "force"
-# Write values sent to the device (centre of each range).
-_SG_READY_PVMAXCOMP: dict[str, float] = {
-    "normal": 0,
-    "encourage": 15,
-    "force": 25,
-}
+# Degrees K by which hc1/seltemp is raised for SG-Ready Mode 3 (encourage).
+# This mirrors the thermostat's own pvraiseheat parameter (typically 3 K).
+SG_READY_SELTEMP_OFFSET_K: float = 3.0
+
+_SG_READY_MODES = frozenset({"normal", "encourage", "force"})
 
 
 def _is_unimplemented(err: grpc.aio.AioRpcError) -> bool:
@@ -83,6 +81,9 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ski_registered: bool = False
         self._not_found_streak: int = 0
         self._last_lpc_write: float = 0.0
+        self._last_sg_ready_write: float = 0.0
+        # seltemp saved before an encourage/force transition so we can restore it.
+        self._sg_ready_base_seltemp: float | None = None
         self._emsesp_url: str = ""
         # User-configured durations (in seconds). Defaults match previous hard-coded values.
         self.lpc_duration_seconds: int = 3600
@@ -345,24 +346,37 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data["lpc_supported"] = self._lpc_supported
             data["failsafe_supported"] = self._failsafe_supported
 
-            # Read EMS-ESP pvmaxcomp to derive current SG-Ready mode.
+            # Read thermostat hc1 data to derive current SG-Ready mode.
             # Don't let EMS-ESP errors fail the whole EEBUS poll.
-            pvmaxcomp = await self._async_read_emsesp_pvmaxcomp()
-            if pvmaxcomp is not None:
-                data["sg_ready_pvmaxcomp"] = pvmaxcomp
-                # The Bosch Compress 5800i reports pvmaxcomp ≈ 1.5 in factory/idle
-                # state (SG-Ready not active).  Threshold for "normal" is therefore
-                # < 5 rather than <= 0, covering both 0 and the factory default.
-                # Mode 3 (encourage) is written as 15, Mode 4 (force) as 25 — both
-                # well above the 5 W threshold.
-                if pvmaxcomp < _SG_READY_NORMAL_MAX:
-                    data["sg_ready_mode"] = "normal"
-                elif pvmaxcomp < _SG_READY_FORCE_MIN:
-                    data["sg_ready_mode"] = "encourage"
+            # SG-Ready is controlled via thermostat boost (Mode 4/force) and
+            # hc1/seltemp offset (Mode 3/encourage) — NOT via pvmaxcomp.
+            hc1 = await self._async_read_emsesp_hc1()
+            if hc1 is not None:
+                data["sg_ready_hc1_boost"] = hc1.get("boost")
+                data["sg_ready_hc1_seltemp"] = hc1.get("seltemp")
+                # Outside the write-protection window, re-derive mode from
+                # thermostat state.  During the window, keep the optimistic value.
+                if time.monotonic() - self._last_sg_ready_write >= SG_READY_WRITE_PROTECTION_SECS:
+                    if hc1.get("boost"):
+                        data["sg_ready_mode"] = "force"
+                    elif (
+                        self._sg_ready_base_seltemp is not None
+                        and hc1.get("seltemp") is not None
+                        and hc1["seltemp"] >= self._sg_ready_base_seltemp + SG_READY_SELTEMP_OFFSET_K - 0.5
+                    ):
+                        data["sg_ready_mode"] = "encourage"
+                    else:
+                        data["sg_ready_mode"] = "normal"
+                        # Record base seltemp while in normal mode so we can
+                        # raise it accurately when switching to encourage.
+                        if hc1.get("seltemp") is not None:
+                            self._sg_ready_base_seltemp = float(hc1["seltemp"])
                 else:
-                    data["sg_ready_mode"] = "force"
+                    # Preserve the optimistic mode written by async_set_sg_ready_mode.
+                    data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
             else:
-                data["sg_ready_pvmaxcomp"] = self.data.get("sg_ready_pvmaxcomp") if self.data else None
+                data["sg_ready_hc1_boost"] = self.data.get("sg_ready_hc1_boost") if self.data else None
+                data["sg_ready_hc1_seltemp"] = self.data.get("sg_ready_hc1_seltemp") if self.data else None
                 data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
 
             # Re-registration streak: any successful gRPC response proves the device
@@ -756,45 +770,83 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
 
     async def async_set_sg_ready_mode(self, mode: str) -> None:
-        """Set SG-Ready mode via EMS-ESP pvmaxcomp.
+        """Set SG-Ready mode via EMS-ESP thermostat controls.
+
+        Mapping to CS5800i / Rego 3000 thermostat commands:
+          normal   (Mode 2): boost=0, hc1/seltemp restored to base value
+          encourage (Mode 3): boost=0, hc1/seltemp raised by SG_READY_SELTEMP_OFFSET_K
+          force    (Mode 4): boost=1  (max compressor, thermostat manages seltemp)
 
         mode: "normal" | "encourage" | "force"
         """
         if not self._emsesp_url:
             raise ValueError("EMS-ESP URL not configured; set it via integration options")
 
-        if mode not in _SG_READY_PVMAXCOMP:
-            raise ValueError(f"Invalid SG-Ready mode: {mode!r}. Must be one of {list(_SG_READY_PVMAXCOMP)}")
+        if mode not in _SG_READY_MODES:
+            raise ValueError(f"Invalid SG-Ready mode: {mode!r}. Must be one of {sorted(_SG_READY_MODES)}")
 
-        pvmaxcomp = _SG_READY_PVMAXCOMP[mode]
-        await self._emsesp_post("boiler", "pvmaxcomp", pvmaxcomp)
-
-        # For Force mode: also trigger DHW one-time heating to maximise thermal storage.
-        if mode == "force":
-            try:
-                await self._emsesp_post("boiler", "dhw/onetime", 1)
-            except Exception:
-                _LOGGER.warning("EMS-ESP DHW one-time heating trigger failed (non-fatal)")
-
-        # Optimistic update so the select entity shows the new state immediately.
+        # Stamp before any awaits so concurrent polls see the protection window.
+        self._last_sg_ready_write = time.monotonic()
+        # Optimistic update so the entity reflects the new state immediately.
         if self.data is not None:
             self.data["sg_ready_mode"] = mode
-            self.data["sg_ready_pvmaxcomp"] = pvmaxcomp
 
-    async def _async_read_emsesp_pvmaxcomp(self) -> float | None:
-        """Read current pvmaxcomp from EMS-ESP to determine SG-Ready state."""
+        if mode == "force":
+            await self._emsesp_post("thermostat", "hc1/boost", 1)
+
+        elif mode == "encourage":
+            # Save base seltemp if not already stored (e.g. first use after restart).
+            if self._sg_ready_base_seltemp is None:
+                seltemp = await self._async_read_emsesp_seltemp()
+                if seltemp is not None:
+                    self._sg_ready_base_seltemp = seltemp
+                else:
+                    _LOGGER.warning(
+                        "SG-Ready encourage: could not read current seltemp from EMS-ESP; "
+                        "using fallback base of 21 °C"
+                    )
+                    self._sg_ready_base_seltemp = 21.0
+            target = self._sg_ready_base_seltemp + SG_READY_SELTEMP_OFFSET_K
+            await self._emsesp_post("thermostat", "hc1/seltemp", target)
+            # Make sure boost is off (in case we're coming from force).
+            await self._emsesp_post("thermostat", "hc1/boost", 0)
+
+        else:  # normal
+            await self._emsesp_post("thermostat", "hc1/boost", 0)
+            if self._sg_ready_base_seltemp is not None:
+                await self._emsesp_post("thermostat", "hc1/seltemp", self._sg_ready_base_seltemp)
+
+        _LOGGER.debug("SG-Ready mode set to %r (base_seltemp=%s)", mode, self._sg_ready_base_seltemp)
+
+    async def _async_read_emsesp_hc1(self) -> dict | None:
+        """Read thermostat hc1 data from EMS-ESP (boost, seltemp, ...)."""
         if not self._emsesp_url:
             return None
-        url = f"{self._emsesp_url}/api/boiler/pvmaxcomp"
+        url = f"{self._emsesp_url}/api/thermostat/hc1"
         session = async_get_clientsession(self.hass)
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    # EMS-ESP returns {"api_data": <value>} or just the value
+                    if isinstance(data, dict):
+                        return data
+        except Exception as err:
+            _LOGGER.debug("EMS-ESP GET thermostat/hc1 failed: %s", err)
+        return None
+
+    async def _async_read_emsesp_seltemp(self) -> float | None:
+        """Read the current hc1/seltemp from EMS-ESP."""
+        if not self._emsesp_url:
+            return None
+        url = f"{self._emsesp_url}/api/thermostat/hc1/seltemp"
+        session = async_get_clientsession(self.hass)
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
                     if isinstance(data, dict):
                         return float(data.get("api_data", data.get("value", 0)))
                     return float(data)
         except Exception as err:
-            _LOGGER.debug("EMS-ESP GET pvmaxcomp failed: %s", err)
+            _LOGGER.debug("EMS-ESP GET thermostat/hc1/seltemp failed: %s", err)
         return None

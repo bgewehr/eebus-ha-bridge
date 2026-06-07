@@ -66,3 +66,6 @@ class EebusSGReadySelect(EebusEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Set SG-Ready mode via EMS-ESP."""
         await self.coordinator.async_set_sg_ready_mode(option)
+        # Coordinator.data was updated optimistically; notify HA immediately
+        # so the entity does not show a stale value until the next 30 s poll.
+        self.async_write_ha_state()
