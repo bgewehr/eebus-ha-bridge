@@ -85,6 +85,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_sg_ready_write: float = 0.0
         # DHW seltemp saved before an encourage transition so we can restore it on normal.
         self._sg_ready_base_dhw_seltemp: float | None = None
+        self._sg_ready_base_dhw_mode: str | None = None
         self._emsesp_url: str = ""
         # User-configured durations (in seconds). Defaults match previous hard-coded values.
         self.lpc_duration_seconds: int = 3600
@@ -347,37 +348,24 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data["lpc_supported"] = self._lpc_supported
             data["failsafe_supported"] = self._failsafe_supported
 
-            # Read thermostat hc1 data to derive current SG-Ready mode.
-            # Don't let EMS-ESP errors fail the whole EEBUS poll.
-            # SG-Ready is controlled via boiler DHW commands (Mode 3/encourage
-            # and Mode 4/force).  Thermostat hc1/heating is not touched.
-            dhw_seltemp = await self._async_read_emsesp_dhw_seltemp()
-            if dhw_seltemp is not None:
-                data["sg_ready_dhw_seltemp"] = dhw_seltemp
-                # force mode is a one-shot DHW command (dhw/onetime) — there is no
-                # persistent device state we can poll to detect it.  Only "encourage"
-                # leaves a readable trace (raised DHW seltemp).  Outside the write-
-                # protection window we therefore only distinguish normal vs. encourage;
-                # force is kept from the optimistic state until the user resets it.
+            # SG-Ready state: read thermostat/dhw/charge + thermostat/dhw/mode.
+            # We control SG-Ready via the Rego 3000 thermostat — not boiler/dhw/onetime.
+            dhw_charge = await self._async_read_emsesp_field("thermostat", "dhw/charge")
+            dhw_mode_str = await self._async_read_emsesp_str_field("thermostat", "dhw/mode")
+            if dhw_mode_str is not None:
+                data["sg_ready_dhw_mode"] = dhw_mode_str
                 if time.monotonic() - self._last_sg_ready_write >= SG_READY_WRITE_PROTECTION_SECS:
-                    current_mode = self.data.get("sg_ready_mode") if self.data else None
-                    if current_mode == "force":
-                        # Keep force until the user explicitly selects normal/encourage.
+                    if dhw_charge is not None and dhw_charge >= 1:
                         data["sg_ready_mode"] = "force"
-                    elif (
-                        self._sg_ready_base_dhw_seltemp is not None
-                        and dhw_seltemp >= self._sg_ready_base_dhw_seltemp + SG_READY_DHW_OFFSET_K - 0.5
-                    ):
+                    elif dhw_mode_str == "eco":
                         data["sg_ready_mode"] = "encourage"
                     else:
                         data["sg_ready_mode"] = "normal"
-                        # Record base DHW seltemp while in normal mode.
-                        self._sg_ready_base_dhw_seltemp = dhw_seltemp
+                        self._sg_ready_base_dhw_mode = dhw_mode_str
                 else:
-                    # Preserve the optimistic mode written by async_set_sg_ready_mode.
                     data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
             else:
-                data["sg_ready_dhw_seltemp"] = self.data.get("sg_ready_dhw_seltemp") if self.data else None
+                data["sg_ready_dhw_mode"] = self.data.get("sg_ready_dhw_mode") if self.data else None
                 data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
 
             # Re-registration streak: any successful gRPC response proves the device
@@ -769,15 +757,14 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
 
     async def async_set_sg_ready_mode(self, mode: str) -> None:
-        """Set SG-Ready mode via EMS-ESP boiler DHW commands.
+        """Set SG-Ready mode via EMS-ESP thermostat commands (Rego 3000 / UI800).
 
-        The CS5800i handles heating vs. DHW via a 3/4-way valve and cannot do
-        both simultaneously.  During PV surplus we prefer DHW as the higher-
-        value thermal store.  Heating (hc1) is not touched.
+        The Bosch CS5800i is controlled by the Rego 3000 thermostat.
+        boiler/dhw/onetime (UBAFlags) has no effect on this HP type.
 
-          normal   (Mode 2): restore boiler/dhw/seltemp to base value
-          encourage (Mode 3): raise boiler/dhw/seltemp by SG_READY_DHW_OFFSET_K
-          force    (Mode 4): trigger one-time DHW charge (boiler/dhw/onetime=1)
+          normal   (Mode 2): thermostat/dhw/charge = false  + restore dhw/mode
+          encourage (Mode 3): thermostat/dhw/mode = "eco"   (stop at ~58 °C)
+          force    (Mode 4): thermostat/dhw/charge = true   (immediate charge)
 
         mode: "normal" | "encourage" | "force"
         """
@@ -793,42 +780,43 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.data is not None:
             self.data["sg_ready_mode"] = mode
 
+        # Snapshot original DHW mode for later restore (only once).
+        if self._sg_ready_base_dhw_mode is None:
+            base_mode = await self._async_read_emsesp_str_field("thermostat", "dhw/mode")
+            self._sg_ready_base_dhw_mode = base_mode if base_mode is not None else "eco+"
+            _LOGGER.info("SG-Ready: snapshotted base thermostat/dhw/mode = %r", self._sg_ready_base_dhw_mode)
+
         if mode == "force":
-            # Prioritise DHW: one-time charge fills the hot-water tank.
-            # The heat pump handles heating vs. DHW via its internal 3/4-way valve
-            # and cannot do both simultaneously, so we pick DHW as the higher-value
-            # thermal store during PV surplus.
-            _LOGGER.info("SG-Ready force: sending dhw/onetime=1 to EMS-ESP")
-            await self._emsesp_post("boiler", "dhw/onetime", True)
-            _LOGGER.info("SG-Ready force: dhw/onetime sent successfully")
+            # thermostat/dhw/charge = 1 triggers an immediate DHW charge cycle.
+            # This is the correct command for the CS5800i — the Rego 3000 thermostat
+            # sends the charge request directly to the heat pump controller.
+            # boiler/dhw/onetime (UBAFlags) has no effect on this HP type.
+            _LOGGER.info("SG-Ready force: setting thermostat/dhw/charge = 1")
+            await self._emsesp_post("thermostat", "dhw/charge", True)
 
         elif mode == "encourage":
-            # Raise DHW target temperature to encourage hot-water charging.
-            if self._sg_ready_base_dhw_seltemp is None:
-                base = await self._async_read_emsesp_dhw_seltemp()
-                if base is not None:
-                    self._sg_ready_base_dhw_seltemp = base
-                else:
-                    _LOGGER.warning(
-                        "SG-Ready encourage: could not read current dhw/seltemp from EMS-ESP; "
-                        "using fallback base of 50 °C"
-                    )
-                    self._sg_ready_base_dhw_seltemp = 50.0
-            target = self._sg_ready_base_dhw_seltemp + SG_READY_DHW_OFFSET_K
-            await self._emsesp_post("boiler", "dhw/seltemp", target)
+            # Raise DHW stop temperature by switching mode to "eco" (ecostop ~58 °C)
+            # so the WP charges a few extra degrees during PV surplus.
+            _LOGGER.info("SG-Ready encourage: setting thermostat/dhw/mode to 'eco'")
+            await self._emsesp_post("thermostat", "dhw/mode", "eco")
 
         else:  # normal
-            # Restore DHW seltemp to pre-encourage value (no-op if never raised).
-            if self._sg_ready_base_dhw_seltemp is not None:
-                await self._emsesp_post("boiler", "dhw/seltemp", self._sg_ready_base_dhw_seltemp)
+            # Cancel any active charge and restore original DHW mode.
+            _LOGGER.info("SG-Ready normal: clearing thermostat/dhw/charge")
+            await self._emsesp_post("thermostat", "dhw/charge", False)
+            restore = self._sg_ready_base_dhw_mode
+            _LOGGER.info("SG-Ready normal: restoring thermostat/dhw/mode to %r", restore)
+            await self._emsesp_post("thermostat", "dhw/mode", restore)
+            # Clear snapshot so the next non-normal transition re-reads the current base.
+            self._sg_ready_base_dhw_mode = None
 
-        _LOGGER.debug("SG-Ready mode set to %r (base_dhw_seltemp=%s)", mode, self._sg_ready_base_dhw_seltemp)
+        _LOGGER.debug("SG-Ready mode set to %r (base_dhw_mode=%s)", mode, self._sg_ready_base_dhw_mode)
 
-    async def _async_read_emsesp_dhw_seltemp(self) -> float | None:
-        """Read the current boiler/dhw/seltemp from EMS-ESP."""
+    async def _async_read_emsesp_field(self, device: str, field: str) -> float | None:
+        """Read a numeric field from the EMS-ESP REST API."""
         if not self._emsesp_url:
             return None
-        url = f"{self._emsesp_url}/api/boiler/dhw/seltemp"
+        url = f"{self._emsesp_url}/api/{device}/{field}"
         session = async_get_clientsession(self.hass)
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -838,5 +826,27 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         return float(data.get("api_data", data.get("value", 0)))
                     return float(data)
         except Exception as err:
-            _LOGGER.debug("EMS-ESP GET boiler/dhw/seltemp failed: %s", err)
+            _LOGGER.debug("EMS-ESP GET %s/%s failed: %s", device, field, err)
         return None
+
+    async def _async_read_emsesp_str_field(self, device: str, field: str) -> str | None:
+        """Read a string field from the EMS-ESP REST API."""
+        if not self._emsesp_url:
+            return None
+        url = f"{self._emsesp_url}/api/{device}/{field}"
+        session = async_get_clientsession(self.hass)
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if isinstance(data, dict):
+                        val = data.get("api_data", data.get("value"))
+                        return str(val) if val is not None else None
+                    return str(data) if data is not None else None
+        except Exception as err:
+            _LOGGER.debug("EMS-ESP GET %s/%s failed: %s", device, field, err)
+        return None
+
+    async def _async_read_emsesp_dhw_seltemp(self) -> float | None:
+        """Read the current boiler/dhw/seltemp from EMS-ESP."""
+        return await self._async_read_emsesp_field("boiler", "dhw/seltemp")
