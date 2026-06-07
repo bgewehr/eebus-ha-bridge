@@ -24,6 +24,10 @@ RE_REGISTER_NOT_FOUND_STREAK = 4
 # After a LPC write, protect the optimistic is_active state for this many seconds
 # to prevent the next coordinator poll from reverting it before the device confirms.
 LPC_WRITE_PROTECTION_SECS = 8.0
+# After a SG-Ready mode write, protect the optimistic sg_ready_mode for this many
+# seconds.  EMS-ESP accepts the write immediately, but the heat pump controller
+# may take several seconds to reflect the new pvmaxcomp in a read-back.
+SG_READY_WRITE_PROTECTION_SECS = 15.0
 
 # pvmaxcomp thresholds for SG-Ready mode detection.
 # The Bosch Compress 5800i idles at ≈ 1.5 (not 0), so "normal" covers [0, 5).
@@ -83,6 +87,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ski_registered: bool = False
         self._not_found_streak: int = 0
         self._last_lpc_write: float = 0.0
+        self._last_sg_ready_write: float = 0.0
         self._emsesp_url: str = ""
         # User-configured durations (in seconds). Defaults match previous hard-coded values.
         self.lpc_duration_seconds: int = 3600
@@ -350,17 +355,20 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             pvmaxcomp = await self._async_read_emsesp_pvmaxcomp()
             if pvmaxcomp is not None:
                 data["sg_ready_pvmaxcomp"] = pvmaxcomp
-                # The Bosch Compress 5800i reports pvmaxcomp ≈ 1.5 in factory/idle
-                # state (SG-Ready not active).  Threshold for "normal" is therefore
-                # < 5 rather than <= 0, covering both 0 and the factory default.
-                # Mode 3 (encourage) is written as 15, Mode 4 (force) as 25 — both
-                # well above the 5 W threshold.
-                if pvmaxcomp < _SG_READY_NORMAL_MAX:
-                    data["sg_ready_mode"] = "normal"
-                elif pvmaxcomp < _SG_READY_FORCE_MIN:
-                    data["sg_ready_mode"] = "encourage"
+                # Only re-derive the mode from pvmaxcomp when outside the write-
+                # protection window.  The heat pump controller may take several
+                # seconds to confirm the new value; reading too early would flip
+                # the entity back to the previous mode (e.g. force → encourage).
+                if time.monotonic() - self._last_sg_ready_write >= SG_READY_WRITE_PROTECTION_SECS:
+                    if pvmaxcomp < _SG_READY_NORMAL_MAX:
+                        data["sg_ready_mode"] = "normal"
+                    elif pvmaxcomp < _SG_READY_FORCE_MIN:
+                        data["sg_ready_mode"] = "encourage"
+                    else:
+                        data["sg_ready_mode"] = "force"
                 else:
-                    data["sg_ready_mode"] = "force"
+                    # Preserve the optimistic mode written by async_set_sg_ready_mode.
+                    data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
             else:
                 data["sg_ready_pvmaxcomp"] = self.data.get("sg_ready_pvmaxcomp") if self.data else None
                 data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
@@ -767,6 +775,13 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise ValueError(f"Invalid SG-Ready mode: {mode!r}. Must be one of {list(_SG_READY_PVMAXCOMP)}")
 
         pvmaxcomp = _SG_READY_PVMAXCOMP[mode]
+        # Stamp the write timestamp BEFORE the HTTP call so any concurrent
+        # coordinator poll that fires during the await sees the protection window.
+        self._last_sg_ready_write = time.monotonic()
+        # Optimistic update so the entity reflects the new state immediately.
+        if self.data is not None:
+            self.data["sg_ready_mode"] = mode
+            self.data["sg_ready_pvmaxcomp"] = pvmaxcomp
         await self._emsesp_post("boiler", "pvmaxcomp", pvmaxcomp)
 
         # For Force mode: also trigger DHW one-time heating to maximise thermal storage.
@@ -776,10 +791,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except Exception:
                 _LOGGER.warning("EMS-ESP DHW one-time heating trigger failed (non-fatal)")
 
-        # Optimistic update so the select entity shows the new state immediately.
-        if self.data is not None:
-            self.data["sg_ready_mode"] = mode
-            self.data["sg_ready_pvmaxcomp"] = pvmaxcomp
+        _LOGGER.debug("SG-Ready mode set to %r (pvmaxcomp=%s)", mode, pvmaxcomp)
 
     async def _async_read_emsesp_pvmaxcomp(self) -> float | None:
         """Read current pvmaxcomp from EMS-ESP to determine SG-Ready state."""
