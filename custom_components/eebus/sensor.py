@@ -388,7 +388,7 @@ class EebusNominalMaxPowerSensor(EebusEntity, SensorEntity):
 
 
 class EebusLimitDurationSensor(EebusEntity, SensorEntity):
-    """Sensor for current LPC limit duration."""
+    """Sensor showing remaining active limit time (countdown from device)."""
 
     _attr_native_unit_of_measurement = "s"
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -405,5 +405,9 @@ class EebusLimitDurationSensor(EebusEntity, SensorEntity):
             return None
         limit = self.coordinator.data.get("consumption_limit")
         if limit is None:
+            return None
+        # Only meaningful when limit is active; hide when inactive to avoid
+        # confusion (device returns stale or zero countdown when not active).
+        if not limit.get("is_active"):
             return None
         return limit.get("duration_seconds")

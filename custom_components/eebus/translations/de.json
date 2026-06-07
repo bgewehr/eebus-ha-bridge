@@ -59,7 +59,7 @@
       "voltage_l3": { "name": "Spannung L3" },
       "consumption_limit": { "name": "Leistungslimit" },
       "nominal_max_power": { "name": "Nominale Maximalleistung" },
-      "limit_duration": { "name": "Limit-Dauer" }
+      "limit_duration": { "name": "Verbleibende Limit-Dauer" }
     },
     "number": {
       "lpc_limit": { "name": "LPC Limit" },

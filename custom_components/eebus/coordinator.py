@@ -491,29 +491,22 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         channel = await self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
-        # Use duration from current device state; fallback to 3600s so the
-        # Bosch WP does not immediately reset active=false on duration=0.
-        current_limit = (self.data or {}).get("consumption_limit") or {}
-        duration = int(current_limit.get("duration_seconds") or 0)
-        if duration == 0:
-            duration = 3600
         try:
             await stub.WriteConsumptionLimit(
                 proto_stubs.WriteLoadLimitRequest(
                     ski=self.ski, value_watts=value_watts, is_active=True,
-                    duration_seconds=duration,
+                    duration_seconds=3600,
                 ),
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
-            # Optimistically update coordinator data so the UI reflects the
-            # written state immediately without waiting for the next poll.
+            # Optimistically update value and active state.
+            # Never cache duration_seconds — the device returns a countdown.
             if self.data is not None:
                 if self.data.get("consumption_limit") is None:
                     self.data["consumption_limit"] = {}
                 self.data["consumption_limit"]["value_watts"] = value_watts
                 self.data["consumption_limit"]["is_active"] = True
-                self.data["consumption_limit"]["duration_seconds"] = duration
         except grpc.aio.AioRpcError as err:
             if _is_unimplemented(err):
                 self._lpc_supported = False
@@ -553,14 +546,12 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current = await stub.GetConsumptionLimit(
             proto_stubs.DeviceRequest(ski=self.ski), timeout=RPC_TIMEOUT
         )
-        # If activating, ensure duration > 0 so the Bosch WP does not
-        # immediately reset the active flag when duration=0 is received.
-        # If deactivating, explicitly send duration=0 to clear the limit.
-        duration = int(current.duration_seconds or 0)
-        if active and duration == 0:
-            duration = 3600
-        elif not active:
-            duration = 0
+        # Always use a fixed duration of 3600s when activating.
+        # The device returns a countdown (remaining time) for duration_seconds,
+        # not the configured value — so we must never reuse it as input.
+        # When deactivating, send the same value_watts but with is_active=False
+        # and a valid duration so the device keeps the stored limit.
+        duration = 3600
         try:
             await stub.WriteConsumptionLimit(
                 proto_stubs.WriteLoadLimitRequest(
@@ -572,12 +563,10 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
-            # Optimistically update coordinator data so the UI reflects the
-            # written state immediately without waiting for the next poll,
-            # which could race against the device processing the write.
+            # Optimistically update only is_active in coordinator data.
+            # Never cache duration_seconds from the device — it is a countdown.
             if self.data and self.data.get("consumption_limit") is not None:
                 self.data["consumption_limit"]["is_active"] = active
-                self.data["consumption_limit"]["duration_seconds"] = duration
         except grpc.aio.AioRpcError as err:
             if _is_unimplemented(err):
                 self._lpc_supported = False
