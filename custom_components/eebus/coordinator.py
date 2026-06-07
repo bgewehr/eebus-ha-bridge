@@ -31,11 +31,6 @@ def _is_unimplemented(err: grpc.aio.AioRpcError) -> bool:
     return err.code() == grpc.StatusCode.UNIMPLEMENTED
 
 
-def _is_not_found(err: grpc.aio.AioRpcError) -> bool:
-    """Return True when gRPC reports missing entity/data for requested SKI."""
-    return err.code() == grpc.StatusCode.NOT_FOUND
-
-
 def _rpc_error_text(err: grpc.aio.AioRpcError) -> str:
     """Build compact debug output for gRPC errors."""
     return f"code={err.code().name} details={err.details()}"
@@ -101,7 +96,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             status = await device_stub.GetStatus(proto_stubs.Empty())
 
             if not self._ski_registered:
-                await self._async_register_remote_ski(device_stub, proto_stubs, force=False)
+                await self._async_register_remote_ski(device_stub, force=False)
 
             data: dict[str, Any] = {
                 "connected": status.running,
@@ -368,7 +363,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._not_found_streak,
                     self.ski,
                 )
-                await self._async_register_remote_ski(device_stub, proto_stubs, force=True)
+                await self._async_register_remote_ski(device_stub, force=True)
                 self._not_found_streak = 0
 
             _LOGGER.debug(
@@ -400,24 +395,20 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"gRPC error: {err}") from err
 
     async def _async_register_remote_ski(
-        self, device_stub: Any, proto_stubs: Any, force: bool
+        self, device_stub: Any, force: bool
     ) -> None:
         """Register remote SKI with bridge, optionally forcing re-registration."""
+        from . import proto_stubs
         try:
-            register_request_cls = getattr(proto_stubs, "RegisterSKIRequest", None)
-            if register_request_cls is None:
-                from .generated.eebus.v1.device_service_pb2 import (
-                    RegisterSKIRequest as register_request_cls,
-                )
-
             await device_stub.RegisterRemoteSKI(
-                register_request_cls(ski=self.ski), timeout=RPC_TIMEOUT
+                proto_stubs.RegisterSKIRequest(ski=self.ski), timeout=RPC_TIMEOUT
             )
             self._ski_registered = True
-            if force:
-                _LOGGER.info("Forced re-registration of remote SKI %s with bridge", self.ski)
-            else:
-                _LOGGER.info("Registered remote SKI %s with bridge", self.ski)
+            _LOGGER.info(
+                "%s remote SKI %s with bridge",
+                "Forced re-registration of" if force else "Registered",
+                self.ski,
+            )
         except grpc.aio.AioRpcError as err:
             if force:
                 _LOGGER.warning(
@@ -739,7 +730,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "EMS-ESP POST %s %s=%s → HTTP %s", url, cmd, value, resp.status
                     )
         except Exception as err:
-            _LOGGER.error("EMS-ESP POST %s failed: %s", url, err)
+            _LOGGER.debug("EMS-ESP POST %s %s=%s failed: %s", url, cmd, value, err)
             raise
 
     async def async_set_sg_ready_mode(self, mode: str) -> None:

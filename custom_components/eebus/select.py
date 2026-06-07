@@ -13,8 +13,8 @@ from .entity import EebusEntity
 
 PARALLEL_UPDATES = 0  # Coordinator-based, no per-entity polling
 
-# SG-Ready option keys (translation_key values)
-SG_READY_OPTIONS = ["normal", "encourage", "force"]
+# SG-Ready option keys — must match translation state keys in strings.json / en.json.
+SG_READY_OPTIONS: list[str] = ["normal", "encourage", "force"]
 
 
 async def async_setup_entry(

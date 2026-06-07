@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from . import EebusConfigEntry
+from .const import CONF_DEVICE_SKI, CONF_GRPC_HOST, CONF_GRPC_PORT
 
 
 async def async_get_config_entry_diagnostics(
@@ -18,9 +19,9 @@ async def async_get_config_entry_diagnostics(
 
     return {
         "config": {
-            "grpc_host": entry.data.get("grpc_host"),
-            "grpc_port": entry.data.get("grpc_port"),
-            "device_ski": "**REDACTED**",
+            CONF_GRPC_HOST: entry.data.get(CONF_GRPC_HOST),
+            CONF_GRPC_PORT: entry.data.get(CONF_GRPC_PORT),
+            CONF_DEVICE_SKI: "**REDACTED**",
         },
         "coordinator_data": dict(coordinator.data) if coordinator.data else None,
     }
