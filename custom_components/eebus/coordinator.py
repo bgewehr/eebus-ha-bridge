@@ -349,8 +349,8 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Read thermostat hc1 data to derive current SG-Ready mode.
             # Don't let EMS-ESP errors fail the whole EEBUS poll.
-            # SG-Ready is controlled via thermostat boost (Mode 4/force) and
-            # hc1/seltemp offset (Mode 3/encourage) — NOT via pvmaxcomp.
+            # SG-Ready is controlled via boiler DHW commands (Mode 3/encourage
+            # and Mode 4/force).  Thermostat hc1/heating is not touched.
             dhw_seltemp = await self._async_read_emsesp_dhw_seltemp()
             if dhw_seltemp is not None:
                 data["sg_ready_dhw_seltemp"] = dhw_seltemp
@@ -720,21 +720,19 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._channel = None
 
     # ------------------------------------------------------------------
-    # EMS-ESP integration — SG-Ready control via pvmaxcomp
+    # EMS-ESP integration — SG-Ready control via DHW commands
     # ------------------------------------------------------------------
     # SG-Ready mapping (Bosch Compress 5800i via EMS-ESP REST API):
-    #   Mode 2 Normal      → pvmaxcomp = 0   (WP runs by own logic)
-    #   Mode 3 Encourage   → pvmaxcomp = 15  (moderate PV surplus hint)
-    #   Mode 4 Force       → pvmaxcomp = 25  (max compressor + DHW one-time)
+    #   Mode 2 Normal    → restore boiler/dhw/seltemp to base value
+    #   Mode 3 Encourage → raise boiler/dhw/seltemp by SG_READY_DHW_OFFSET_K (5 K)
+    #   Mode 4 Force     → boiler/dhw/onetime = 1  (one-time DHW charge)
     #
-    # The Bosch factory/idle state reports pvmaxcomp ≈ 1.5 (not 0).
-    # Read-back thresholds therefore use margins around the written values:
-    #   "normal"   if pvmaxcomp < 5    (covers 0 and factory default 1.5)
-    #   "encourage" if 5 ≤ pvmaxcomp < 20
-    #   "force"    if pvmaxcomp ≥ 20
+    # pvmaxcomp is NOT used: it is a PV-mode compressor power limit in kW,
+    # not a SG-Ready activation switch.
     #
     # EMS-ESP REST API: POST http://<host>/api/boiler
-    #   body: {"cmd": "pvmaxcomp", "value": <float>}
+    #   body: {"cmd": "dhw/seltemp", "value": <float>}   (encourage / normal)
+    #         {"cmd": "dhw/onetime", "value": 1}         (force)
     # No authentication needed (notoken_api = true).
     # ------------------------------------------------------------------
 
