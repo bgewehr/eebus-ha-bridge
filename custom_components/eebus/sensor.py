@@ -173,11 +173,13 @@ class EebusConsumptionLimitSensor(EebusEntity, SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return current limit in watts."""
+        """Return current limit in watts, or None when no limit is active."""
         if self.coordinator.data is None:
             return None
         limit = self.coordinator.data.get("consumption_limit")
         if limit is None:
+            return None
+        if not limit.get("is_active"):
             return None
         return limit.get("value_watts")
 
