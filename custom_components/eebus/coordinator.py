@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -18,6 +19,9 @@ _LOGGER = logging.getLogger(__name__)
 POLL_INTERVAL = timedelta(seconds=30)
 RPC_TIMEOUT = 10
 RE_REGISTER_NOT_FOUND_STREAK = 4
+# After a LPC write, protect the optimistic is_active state for this many seconds
+# to prevent the next coordinator poll from reverting it before the device confirms.
+LPC_WRITE_PROTECTION_SECS = 8.0
 
 
 def _is_unimplemented(err: grpc.aio.AioRpcError) -> bool:
@@ -73,6 +77,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._failsafe_supported: bool | None = None
         self._ski_registered: bool = False
         self._not_found_streak: int = 0
+        self._last_lpc_write: float = 0.0
 
     async def _ensure_channel(self) -> grpc.aio.Channel:
         """Create or return existing gRPC channel."""
@@ -219,12 +224,23 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 limit = await lpc_stub.GetConsumptionLimit(
                     request, timeout=RPC_TIMEOUT
                 )
-                data["consumption_limit"] = {
+                polled_limit = {
                     "value_watts": limit.value_watts,
                     "is_active": limit.is_active,
                     "is_changeable": limit.is_changeable,
                     "duration_seconds": limit.duration_seconds,
                 }
+                # If we just sent a write, protect the optimistic is_active for a few
+                # seconds — the device may not have confirmed the change yet.
+                if (
+                    time.monotonic() - self._last_lpc_write < LPC_WRITE_PROTECTION_SECS
+                    and self.data
+                    and self.data.get("consumption_limit") is not None
+                ):
+                    polled_limit["is_active"] = self.data["consumption_limit"].get(
+                        "is_active", polled_limit["is_active"]
+                    )
+                data["consumption_limit"] = polled_limit
                 self._lpc_supported = True
                 _LOGGER.debug(
                     "EEBUS consumption limit read for SKI %s: value=%s active=%s changeable=%s",
@@ -234,8 +250,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     limit.is_changeable,
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_not_found = True
                 data["consumption_limit"] = None
                 _LOGGER.debug(
                     "EEBUS consumption limit read failed for SKI %s: %s",
@@ -262,8 +276,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     failsafe.duration_minimum_seconds,
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_not_found = True
                 data["failsafe_limit"] = None
                 _LOGGER.debug(
                     "EEBUS failsafe read failed for SKI %s: %s",
@@ -291,8 +303,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     hb.within_duration,
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_not_found = True
                 data["heartbeat_status"] = None
                 data["heartbeat_supported"] = self._heartbeat_supported
                 _LOGGER.debug(
@@ -320,8 +330,6 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     nominal_max.watts,
                 )
             except grpc.aio.AioRpcError as err:
-                if _is_not_found(err):
-                    saw_not_found = True
                 data["consumption_nominal_max_watts"] = None
                 _LOGGER.debug(
                     "EEBUS nominal max read failed for SKI %s: %s",
@@ -500,6 +508,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
+            self._last_lpc_write = time.monotonic()
             # Optimistically update value and active state.
             # Never cache duration_seconds — the device returns a countdown.
             if self.data is not None:
@@ -563,6 +572,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
+            self._last_lpc_write = time.monotonic()
             # Optimistically update only is_active in coordinator data.
             # Never cache duration_seconds from the device — it is a countdown.
             if self.data and self.data.get("consumption_limit") is not None:
