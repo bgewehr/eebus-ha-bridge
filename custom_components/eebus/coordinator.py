@@ -761,7 +761,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         url, cmd, value, resp.status, text[:200],
                     )
                 else:
-                    _LOGGER.debug(
+                    _LOGGER.info(
                         "EMS-ESP POST %s %s=%s → HTTP %s", url, cmd, value, resp.status
                     )
         except Exception as err:
@@ -798,7 +798,9 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # The heat pump handles heating vs. DHW via its internal 3/4-way valve
             # and cannot do both simultaneously, so we pick DHW as the higher-value
             # thermal store during PV surplus.
-            await self._emsesp_post("boiler", "dhw/onetime", 1)
+            _LOGGER.info("SG-Ready force: sending dhw/onetime=1 to EMS-ESP")
+            await self._emsesp_post("boiler", "dhw/onetime", True)
+            _LOGGER.info("SG-Ready force: dhw/onetime sent successfully")
 
         elif mode == "encourage":
             # Raise DHW target temperature to encourage hot-water charging.
