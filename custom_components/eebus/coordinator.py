@@ -792,7 +792,14 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.data["sg_ready_mode"] = mode
 
         if mode == "force":
+            # Maximise both thermal stores:
+            #   hc1/boost  → heating circuit runs at max for boosttime hours
+            #   dhw/onetime → one-time DHW charge (stored in the boiler's hot-water tank)
             await self._emsesp_post("thermostat", "hc1/boost", 1)
+            try:
+                await self._emsesp_post("boiler", "dhw/onetime", 1)
+            except Exception:
+                _LOGGER.warning("SG-Ready force: DHW one-time charge trigger failed (non-fatal)")
 
         elif mode == "encourage":
             # Save base seltemp if not already stored (e.g. first use after restart).
