@@ -25,6 +25,17 @@ RE_REGISTER_NOT_FOUND_STREAK = 4
 # to prevent the next coordinator poll from reverting it before the device confirms.
 LPC_WRITE_PROTECTION_SECS = 8.0
 
+# pvmaxcomp thresholds for SG-Ready mode detection.
+# The Bosch Compress 5800i idles at ≈ 1.5 (not 0), so "normal" covers [0, 5).
+_SG_READY_NORMAL_MAX: float = 5.0    # pvmaxcomp < this  → "normal"
+_SG_READY_FORCE_MIN: float = 20.0    # pvmaxcomp >= this → "force"
+# Write values sent to the device (centre of each range).
+_SG_READY_PVMAXCOMP: dict[str, float] = {
+    "normal": 0,
+    "encourage": 15,
+    "force": 25,
+}
+
 
 def _is_unimplemented(err: grpc.aio.AioRpcError) -> bool:
     """Return True when gRPC reports method/use case is not implemented."""
@@ -339,9 +350,14 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             pvmaxcomp = await self._async_read_emsesp_pvmaxcomp()
             if pvmaxcomp is not None:
                 data["sg_ready_pvmaxcomp"] = pvmaxcomp
-                if pvmaxcomp <= 0:
+                # The Bosch Compress 5800i reports pvmaxcomp ≈ 1.5 in factory/idle
+                # state (SG-Ready not active).  Threshold for "normal" is therefore
+                # < 5 rather than <= 0, covering both 0 and the factory default.
+                # Mode 3 (encourage) is written as 15, Mode 4 (force) as 25 — both
+                # well above the 5 W threshold.
+                if pvmaxcomp < _SG_READY_NORMAL_MAX:
                     data["sg_ready_mode"] = "normal"
-                elif pvmaxcomp <= 15:
+                elif pvmaxcomp < _SG_READY_FORCE_MIN:
                     data["sg_ready_mode"] = "encourage"
                 else:
                     data["sg_ready_mode"] = "force"
@@ -696,6 +712,12 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     #   Mode 3 Encourage   → pvmaxcomp = 15  (moderate PV surplus hint)
     #   Mode 4 Force       → pvmaxcomp = 25  (max compressor + DHW one-time)
     #
+    # The Bosch factory/idle state reports pvmaxcomp ≈ 1.5 (not 0).
+    # Read-back thresholds therefore use margins around the written values:
+    #   "normal"   if pvmaxcomp < 5    (covers 0 and factory default 1.5)
+    #   "encourage" if 5 ≤ pvmaxcomp < 20
+    #   "force"    if pvmaxcomp ≥ 20
+    #
     # EMS-ESP REST API: POST http://<host>/api/boiler
     #   body: {"cmd": "pvmaxcomp", "value": <float>}
     # No authentication needed (notoken_api = true).
@@ -741,15 +763,10 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self._emsesp_url:
             raise ValueError("EMS-ESP URL not configured; set it via integration options")
 
-        mode_map: dict[str, float] = {
-            "normal": 0,
-            "encourage": 15,
-            "force": 25,
-        }
-        if mode not in mode_map:
-            raise ValueError(f"Invalid SG-Ready mode: {mode!r}. Must be one of {list(mode_map)}")
+        if mode not in _SG_READY_PVMAXCOMP:
+            raise ValueError(f"Invalid SG-Ready mode: {mode!r}. Must be one of {list(_SG_READY_PVMAXCOMP)}")
 
-        pvmaxcomp = mode_map[mode]
+        pvmaxcomp = _SG_READY_PVMAXCOMP[mode]
         await self._emsesp_post("boiler", "pvmaxcomp", pvmaxcomp)
 
         # For Force mode: also trigger DHW one-time heating to maximise thermal storage.
