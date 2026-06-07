@@ -499,6 +499,15 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         channel = await self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
+        # Set optimistic state BEFORE gRPC calls so any concurrent coordinator
+        # poll sees the protected value immediately during the round-trip.
+        prev_limit = self.data.get("consumption_limit") if self.data else None
+        self._last_lpc_write = time.monotonic()
+        if self.data is not None:
+            if self.data.get("consumption_limit") is None:
+                self.data["consumption_limit"] = {}
+            self.data["consumption_limit"]["value_watts"] = value_watts
+            self.data["consumption_limit"]["is_active"] = True
         try:
             await stub.WriteConsumptionLimit(
                 proto_stubs.WriteLoadLimitRequest(
@@ -508,15 +517,11 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
-            self._last_lpc_write = time.monotonic()
-            # Optimistically update value and active state.
-            # Never cache duration_seconds — the device returns a countdown.
-            if self.data is not None:
-                if self.data.get("consumption_limit") is None:
-                    self.data["consumption_limit"] = {}
-                self.data["consumption_limit"]["value_watts"] = value_watts
-                self.data["consumption_limit"]["is_active"] = True
         except grpc.aio.AioRpcError as err:
+            # Revert optimistic state so the next poll reflects reality.
+            self._last_lpc_write = 0.0
+            if self.data is not None:
+                self.data["consumption_limit"] = prev_limit
             if _is_unimplemented(err):
                 self._lpc_supported = False
                 _LOGGER.info(
@@ -552,32 +557,38 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         channel = await self._ensure_channel()
         from . import proto_stubs
         stub = proto_stubs.LPCServiceStub(channel)
-        current = await stub.GetConsumptionLimit(
-            proto_stubs.DeviceRequest(ski=self.ski), timeout=RPC_TIMEOUT
+        # Optimistically update is_active BEFORE any gRPC call so concurrent
+        # coordinator polls see the protected state during both round-trips.
+        prev_active = (
+            self.data["consumption_limit"].get("is_active")
+            if self.data and self.data.get("consumption_limit") is not None
+            else None
         )
-        # Always use a fixed duration of 3600s when activating.
+        self._last_lpc_write = time.monotonic()
+        if self.data and self.data.get("consumption_limit") is not None:
+            self.data["consumption_limit"]["is_active"] = active
+        # Always use a fixed duration of 3600s.
         # The device returns a countdown (remaining time) for duration_seconds,
         # not the configured value — so we must never reuse it as input.
-        # When deactivating, send the same value_watts but with is_active=False
-        # and a valid duration so the device keeps the stored limit.
-        duration = 3600
         try:
+            current = await stub.GetConsumptionLimit(
+                proto_stubs.DeviceRequest(ski=self.ski), timeout=RPC_TIMEOUT
+            )
             await stub.WriteConsumptionLimit(
                 proto_stubs.WriteLoadLimitRequest(
                     ski=self.ski,
                     value_watts=current.value_watts,
                     is_active=active,
-                    duration_seconds=duration,
+                    duration_seconds=3600,
                 ),
                 timeout=RPC_TIMEOUT,
             )
             self._lpc_supported = True
-            self._last_lpc_write = time.monotonic()
-            # Optimistically update only is_active in coordinator data.
-            # Never cache duration_seconds from the device — it is a countdown.
-            if self.data and self.data.get("consumption_limit") is not None:
-                self.data["consumption_limit"]["is_active"] = active
         except grpc.aio.AioRpcError as err:
+            # Revert optimistic state so the next poll reflects reality.
+            self._last_lpc_write = 0.0
+            if self.data and self.data.get("consumption_limit") is not None:
+                self.data["consumption_limit"]["is_active"] = prev_active
             if _is_unimplemented(err):
                 self._lpc_supported = False
                 _LOGGER.info(
