@@ -30,13 +30,14 @@ async def async_setup_entry(
 class EebusSGReadySelect(EebusEntity, SelectEntity):
     """Select entity for SG-Ready mode control via EMS-ESP.
 
-    Maps to pvmaxcomp on the Bosch heat pump EMS bus:
-      normal   (Mode 2) → pvmaxcomp = 0
-      encourage (Mode 3) → pvmaxcomp = 15  (PV surplus hint)
-      force    (Mode 4) → pvmaxcomp = 25  (max compressor + DHW one-time)
+    Controls the Bosch Compress 5800i DHW via EMS-ESP REST API:
+      normal   (Mode 2) → restore boiler/dhw/seltemp to base value
+      encourage (Mode 3) → raise boiler/dhw/seltemp by 5 K
+      force    (Mode 4) → boiler/dhw/onetime = 1 (one-time DHW charge)
 
     SG-Ready Mode 1 (block/limit) is handled by EEBUS LPC separately.
     Requires EMS-ESP URL configured in integration options.
+    Entity is disabled by default — enable it after configuring the EMS-ESP URL.
     """
 
     _attr_translation_key = "sg_ready_mode"
@@ -58,14 +59,18 @@ class EebusSGReadySelect(EebusEntity, SelectEntity):
 
     @property
     def current_option(self) -> str | None:
-        """Return current SG-Ready mode derived from pvmaxcomp."""
+        """Return current SG-Ready mode (derived from boiler DHW state)."""
         if self.coordinator.data is None:
             return None
         return self.coordinator.data.get("sg_ready_mode")
 
     async def async_select_option(self, option: str) -> None:
         """Set SG-Ready mode via EMS-ESP."""
-        await self.coordinator.async_set_sg_ready_mode(option)
+        try:
+            await self.coordinator.async_set_sg_ready_mode(option)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("SG-Ready: failed to set mode %r: %s", option, err)
+            return
         # Coordinator.data was updated optimistically; notify HA immediately
         # so the entity does not show a stale value until the next 30 s poll.
         self.async_write_ha_state()
