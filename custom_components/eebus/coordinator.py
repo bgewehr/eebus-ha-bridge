@@ -352,12 +352,16 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # hc1/seltemp offset (Mode 3/encourage) — NOT via pvmaxcomp.
             hc1 = await self._async_read_emsesp_hc1()
             if hc1 is not None:
-                data["sg_ready_hc1_boost"] = hc1.get("boost")
                 data["sg_ready_hc1_seltemp"] = hc1.get("seltemp")
-                # Outside the write-protection window, re-derive mode from
-                # thermostat state.  During the window, keep the optimistic value.
+                # force mode is a one-shot DHW command (dhw/onetime) — there is no
+                # persistent device state we can poll to detect it.  Only "encourage"
+                # leaves a readable trace (raised seltemp).  Outside the write-
+                # protection window we therefore only distinguish normal vs. encourage;
+                # force is kept from the optimistic state until the user resets it.
                 if time.monotonic() - self._last_sg_ready_write >= SG_READY_WRITE_PROTECTION_SECS:
-                    if hc1.get("boost"):
+                    current_mode = self.data.get("sg_ready_mode") if self.data else None
+                    if current_mode == "force":
+                        # Keep force until the user explicitly selects normal/encourage.
                         data["sg_ready_mode"] = "force"
                     elif (
                         self._sg_ready_base_seltemp is not None
@@ -367,15 +371,13 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         data["sg_ready_mode"] = "encourage"
                     else:
                         data["sg_ready_mode"] = "normal"
-                        # Record base seltemp while in normal mode so we can
-                        # raise it accurately when switching to encourage.
+                        # Record base seltemp while in normal mode.
                         if hc1.get("seltemp") is not None:
                             self._sg_ready_base_seltemp = float(hc1["seltemp"])
                 else:
                     # Preserve the optimistic mode written by async_set_sg_ready_mode.
                     data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
             else:
-                data["sg_ready_hc1_boost"] = self.data.get("sg_ready_hc1_boost") if self.data else None
                 data["sg_ready_hc1_seltemp"] = self.data.get("sg_ready_hc1_seltemp") if self.data else None
                 data["sg_ready_mode"] = self.data.get("sg_ready_mode") if self.data else None
 
@@ -792,14 +794,11 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.data["sg_ready_mode"] = mode
 
         if mode == "force":
-            # Maximise both thermal stores:
-            #   hc1/boost  → heating circuit runs at max for boosttime hours
-            #   dhw/onetime → one-time DHW charge (stored in the boiler's hot-water tank)
-            await self._emsesp_post("thermostat", "hc1/boost", 1)
-            try:
-                await self._emsesp_post("boiler", "dhw/onetime", 1)
-            except Exception:
-                _LOGGER.warning("SG-Ready force: DHW one-time charge trigger failed (non-fatal)")
+            # Prioritise DHW: one-time charge fills the hot-water tank.
+            # The heat pump handles heating vs. DHW via its internal 3/4-way valve
+            # and cannot do both simultaneously, so we pick DHW as the higher-value
+            # thermal store during PV surplus.
+            await self._emsesp_post("boiler", "dhw/onetime", 1)
 
         elif mode == "encourage":
             # Save base seltemp if not already stored (e.g. first use after restart).
@@ -819,7 +818,7 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._emsesp_post("thermostat", "hc1/boost", 0)
 
         else:  # normal
-            await self._emsesp_post("thermostat", "hc1/boost", 0)
+            # Restore seltemp to pre-encourage value (no-op if never raised).
             if self._sg_ready_base_seltemp is not None:
                 await self._emsesp_post("thermostat", "hc1/seltemp", self._sg_ready_base_seltemp)
 
