@@ -250,9 +250,16 @@ func (s *LPCService) SubscribeLPCEvents(req *pb.DeviceRequest, stream pb.LPCServ
 }
 
 func convertLoadLimit(l ucapi.LoadLimit) *pb.LoadLimit {
+	durationSecs := int64(l.Duration / time.Second)
+	// The device keeps counting down duration even when inactive, which produces
+	// large negative values.  Zero it out when the limit is not active so callers
+	// see a clean 0 instead of a stale countdown.
+	if !l.IsActive {
+		durationSecs = 0
+	}
 	return &pb.LoadLimit{
 		ValueWatts:      l.Value,
-		DurationSeconds: int64(l.Duration / time.Second),
+		DurationSeconds: durationSecs,
 		IsActive:        l.IsActive,
 		IsChangeable:    l.IsChangeable,
 	}

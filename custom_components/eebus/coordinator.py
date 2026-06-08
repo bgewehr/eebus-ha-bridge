@@ -232,7 +232,9 @@ class EebusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "value_watts": limit.value_watts,
                     "is_active": limit.is_active,
                     "is_changeable": limit.is_changeable,
-                    "duration_seconds": limit.duration_seconds,
+                    # Zero out duration when inactive — the device keeps counting
+                    # down even when the limit is not active, producing negative values.
+                    "duration_seconds": limit.duration_seconds if limit.is_active else 0,
                 }
                 # If we just sent a write, protect the optimistic is_active for a few
                 # seconds — the device may not have confirmed the change yet.
