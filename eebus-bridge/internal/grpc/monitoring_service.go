@@ -25,20 +25,15 @@ type MonitoringService struct {
 	registry        *eebus.DeviceRegistry
 	debugProtocol   bool
 	rawDumpDoneSKIs map[string]bool
-	// unsupportedFields tracks measurement fields that have never returned data.
-	// Once a field succeeds we remove the SKI; once we have logged the first failure
-	// we mark it to suppress repeated per-poll noise.
-	unsupportedLogged map[string]bool // key: ski+":"+field
 }
 
 func NewMonitoringService(monitoring *usecases.MonitoringWrapper, bus *eebus.EventBus, registry *eebus.DeviceRegistry, debugProtocol bool) *MonitoringService {
 	return &MonitoringService{
-		monitoring:        monitoring,
-		bus:               bus,
-		registry:          registry,
-		debugProtocol:     debugProtocol,
-		rawDumpDoneSKIs:   make(map[string]bool),
-		unsupportedLogged: make(map[string]bool),
+		monitoring:      monitoring,
+		bus:             bus,
+		registry:        registry,
+		debugProtocol:   debugProtocol,
+		rawDumpDoneSKIs: make(map[string]bool),
 	}
 }
 
@@ -119,41 +114,33 @@ func (s *MonitoringService) GetMeasurements(_ context.Context, req *pb.DeviceReq
 	}
 
 	if values, err := s.readPowerPerPhase(req.Ski); err == nil {
-		delete(s.unsupportedLogged, req.Ski+":powerPerPhase")
 		for idx, value := range values {
 			appendMeasurement(&measurements, now, fmt.Sprintf("power_l%d", idx+1), value, "W")
 		}
-	} else if !s.unsupportedLogged[req.Ski+":powerPerPhase"] {
-		s.unsupportedLogged[req.Ski+":powerPerPhase"] = true
-		log.Printf("[DEBUG] Monitoring.GetMeasurements readPowerPerPhase not available for ski=%s (will not repeat): %v", req.Ski, err)
+	} else if s.debugProtocol {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readPowerPerPhase failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if values, err := s.readCurrentPerPhase(req.Ski); err == nil {
-		delete(s.unsupportedLogged, req.Ski+":currentPerPhase")
 		for idx, value := range values {
 			appendMeasurement(&measurements, now, fmt.Sprintf("current_l%d", idx+1), value, "A")
 		}
-	} else if !s.unsupportedLogged[req.Ski+":currentPerPhase"] {
-		s.unsupportedLogged[req.Ski+":currentPerPhase"] = true
-		log.Printf("[DEBUG] Monitoring.GetMeasurements readCurrentPerPhase not available for ski=%s (will not repeat): %v", req.Ski, err)
+	} else if s.debugProtocol {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readCurrentPerPhase failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if values, err := s.readVoltagePerPhase(req.Ski); err == nil {
-		delete(s.unsupportedLogged, req.Ski+":voltagePerPhase")
 		for idx, value := range values {
 			appendMeasurement(&measurements, now, fmt.Sprintf("voltage_l%d", idx+1), value, "V")
 		}
-	} else if !s.unsupportedLogged[req.Ski+":voltagePerPhase"] {
-		s.unsupportedLogged[req.Ski+":voltagePerPhase"] = true
-		log.Printf("[DEBUG] Monitoring.GetMeasurements readVoltagePerPhase not available for ski=%s (will not repeat): %v", req.Ski, err)
+	} else if s.debugProtocol {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readVoltagePerPhase failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if value, err := s.readFrequency(req.Ski); err == nil {
-		delete(s.unsupportedLogged, req.Ski+":frequency")
 		appendMeasurement(&measurements, now, "frequency", value, "Hz")
-	} else if !s.unsupportedLogged[req.Ski+":frequency"] {
-		s.unsupportedLogged[req.Ski+":frequency"] = true
-		log.Printf("[DEBUG] Monitoring.GetMeasurements readFrequency not available for ski=%s (will not repeat): %v", req.Ski, err)
+	} else if s.debugProtocol {
+		log.Printf("[DEBUG] Monitoring.GetMeasurements readFrequency failed: requested_ski=%s err=%v", req.Ski, err)
 	}
 
 	if value, err := s.readEnergyConsumed(req.Ski); err == nil {
